@@ -542,6 +542,43 @@ let check_implicit_meaningful ?loc k env =
   else
     k
 
+(* rocq2lean fork: per source span, the free variables a generalizing binder
+   `(..)`/`{..}` introduces (the NEWLY generalized vars; already-bound ones are
+   excluded). Covers BOTH the binder-position path (`intern_generalized_binder`,
+   the common `Lemma f `(C x y) …` case) and the term-position path
+   (`intern_generalization`). Dumped to the translation-metadata sidecar and
+   drained by `take_generalizing_binders`. `is_impl` marks `{..}` vs `(..)`. *)
+let generalizing_binders : (Loc.t option * bool * Names.Id.t list) list ref = ref []
+let take_generalizing_binders () =
+  let s = List.rev !generalizing_binders in generalizing_binders := []; s
+
+(* rocq2lean fork: per-occurrence resolved reference names. After interning a
+   term, walk the resulting glob_constr and record (loc, GlobRef) for every GRef
+   node — INCLUDING refs introduced by notation expansion (`x + y` → `Z.add x y`),
+   which Coq's `.glob` `R`-entries miss (they log the notation, not the expanded
+   head). This is the compile-time, boot-reliable form of the pet fork's runtime
+   `internGlobs`: it lets the translator qualify a reference by Coq's OWN
+   resolution instead of guessing (the `Z`-module-vs-inductive collision). Drained
+   by `take_ref_resolutions`, dumped to the `.r2lmeta.json` sidecar. *)
+let ref_resolutions : (Loc.t option * Names.GlobRef.t) list ref = ref []
+let take_ref_resolutions () =
+  let s = List.rev !ref_resolutions in ref_resolutions := []; s
+(* rocq2lean: resolved SOURCE-BINDER types, keyed by the binder's source loc.
+   Recorded by `comDefinition` after a definition's body is pretyped (evars
+   resolved), so an UNTYPED binder (`Definition valid_binary x := …`) carries its
+   inferred type (`x : spec_float`) keyed by span — the translator fills it by its
+   OWN loc, no fragile after-the-fact telescope alignment. Drained by
+   `take_binder_types`, dumped to the `.r2lmeta.json` sidecar. *)
+let binder_types : (Loc.t option * string) list ref = ref []
+let take_binder_types () =
+  let s = List.rev !binder_types in binder_types := []; s
+let record_binder_type loc s = binder_types := (loc, s) :: !binder_types
+let rec record_grefs c =
+  (match DAst.get c with
+   | GRef (r, _) -> ref_resolutions := (c.CAst.loc, r) :: !ref_resolutions
+   | _ -> ());
+  ignore (Glob_ops.fold_glob_constr (fun () child -> record_grefs child) () c)
+
 let intern_generalized_binder ~dump intern_type ntnvars
     env {loc;v=na} b' t ty =
   let ids = (match na with Anonymous -> fun x -> x | Name na -> Id.Set.add na) env.ids in
@@ -551,6 +588,10 @@ let intern_generalized_binder ~dump intern_type ntnvars
   in
   let ty' = intern_type {env with ids = ids; strict_check = Some false} ty in
   let fvs = Implicit_quantifiers.generalizable_vars_of_glob_constr ~bound:ids ~allowed:ids' ty' in
+  let () =
+    let is_impl = match b' with Glob_term.Explicit -> false | _ -> true in
+    generalizing_binders :=
+      (loc, is_impl, List.map (fun {CAst.v=id} -> id) fvs) :: !generalizing_binders in
   let env' = List.fold_left
     (fun env {loc;v=x} -> push_name_env ~dump ntnvars [](*?*) env (make ?loc @@ Name x))
     env fvs in
@@ -654,6 +695,10 @@ let intern_local_binder_aux ~dump intern ntnvars (env,bl) = function
 let intern_generalization intern env ntnvars loc bk c =
   let c = intern {env with strict_check = Some false} c in
   let fvs = Implicit_quantifiers.generalizable_vars_of_glob_constr ~bound:env.ids c in
+  let () =
+    let is_impl = match bk with Glob_term.Explicit -> false | _ -> true in
+    generalizing_binders :=
+      (loc, is_impl, List.map (fun {CAst.v=id} -> id) fvs) :: !generalizing_binders in
   let env', c' =
     let abs =
       let pi =
@@ -2697,11 +2742,14 @@ let intern_gen kind env sigma
                c =
   let tmp_scope = Option.cata (scope_of_type_kind env sigma) [] kind in
   let k = Option.map allowed_binder_kind_of_type_kind kind in
-  internalize env {ids = extract_ids env; strict_check;
-                   local_univs = { bound = bound_univs sigma; unb_univs = true };
-                   tmp_scope = tmp_scope; scopes = [];
-                   impls; binder_block_names = Some k; ntn_binding_ids = Id.Set.empty}
-    pattern_mode (ltacvars, Id.Map.empty) c
+  let r =
+    internalize env {ids = extract_ids env; strict_check;
+                     local_univs = { bound = bound_univs sigma; unb_univs = true };
+                     tmp_scope = tmp_scope; scopes = [];
+                     impls; binder_block_names = Some k; ntn_binding_ids = Id.Set.empty}
+      pattern_mode (ltacvars, Id.Map.empty) c
+  in
+  record_grefs r; r
 
 let intern_unknown_if_term_or_type env sigma c =
   intern_gen None env sigma c

@@ -53,6 +53,17 @@ type var_internalization_data
 (** A map of free variables to their implicit arguments and scopes *)
 type internalization_env = var_internalization_data Id.Map.t
 
+(* rocq2lean fork: drain the generalizing-binder generated-vars log
+   (span, is_implicit, generalized var ids) accumulated during internalization. *)
+val take_generalizing_binders : unit -> (Loc.t option * bool * Id.t list) list
+
+(* rocq2lean fork: drain the per-occurrence resolved-reference log
+   (span, GlobRef) accumulated during internalization — every GRef in every
+   interned term, including notation-expanded heads. *)
+val take_ref_resolutions : unit -> (Loc.t option * Names.GlobRef.t) list
+val take_binder_types : unit -> (Loc.t option * string) list
+val record_binder_type : Loc.t option -> string -> unit
+
 val empty_internalization_env : internalization_env
 
 val compute_internalization_data : env -> evar_map -> ?silent:bool -> Id.t -> var_internalization_type ->

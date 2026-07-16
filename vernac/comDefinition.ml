@@ -86,7 +86,7 @@ let interp_definition ~program_mode env evd impl_env bl red_option c ctypopt =
   let flags = Pretyping.{ all_no_fail_flags with program_mode } in
   let (bl, c, ctypopt, apply_under_binders) = protect_pattern_in_binder bl c ctypopt in
   (* Build the parameters *)
-  let evd, (impls, ((env_bl, ctx), imps1, _locs)) = interp_context_evars ~program_mode ~impl_env env evd bl in
+  let evd, (impls, ((env_bl, ctx), imps1, r2l_locs)) = interp_context_evars ~program_mode ~impl_env env evd bl in
   (* Build the type *)
   let evd, tyopt = Option.fold_left_map
       (interp_type_evars_impls ~flags ~impls env_bl)
@@ -109,6 +109,31 @@ let interp_definition ~program_mode env evd impl_env bl red_option c ctypopt =
   (* Declare the definition *)
   let c = EConstr.it_mkLambda_or_LetIn c ctx in
   let tyopt = Option.map (fun ty -> EConstr.it_mkProd_or_LetIn ty ctx) tyopt in
+  (* rocq2lean: record each SOURCE binder's RESOLVED type, keyed by its source
+     loc (`evd` final: body pretyped → untyped binders' evars resolved). A
+     rel_decl's type has De Bruijn indices relative to the EARLIER (outer)
+     binders, so print it in an env with those pushed: `fold_right2` walks
+     `ctx`/`r2l_locs` (same order) OUTERMOST-first, printing in the growing env
+     then pushing each decl. Print Set-Printing-All-ish (implicits explicit,
+     notations off) so the string re-parses unambiguously. The translator fills
+     untyped binders by their own span — no after-the-fact telescope alignment. *)
+  (if Sys.getenv_opt "ROCQ2LEAN_META" <> None then begin
+     let open Constrextern in
+     let sv = (!print_implicits, !print_no_symbol, !print_coercions, !print_parentheses) in
+     print_implicits := true; print_no_symbol := true;
+     print_coercions := true; print_parentheses := true;
+     (try ignore (List.fold_right2 (fun decl loc penv ->
+        (match loc with
+         | None -> ()
+         | Some _ ->
+           let ty = Evarutil.nf_evar evd (Context.Rel.Declaration.get_type decl) in
+           let str = Pp.string_of_ppcmds (Printer.pr_econstr_env penv evd ty) in
+           Constrintern.record_binder_type loc str);
+        EConstr.push_rel decl penv) ctx r2l_locs env_bl)
+      with _ -> ());
+     let (a,b,c,d) = sv in
+     print_implicits := a; print_no_symbol := b; print_coercions := c; print_parentheses := d
+   end);
   evd, (c, tyopt), imps
 
 let interp_statement ~program_mode env evd ~flags ~scope name bl typ  =

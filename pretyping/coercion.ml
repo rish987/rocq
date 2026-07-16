@@ -410,12 +410,24 @@ let instance_of_global_constr sigma c =
   | Const (_,u) | Ind (_,u) | Construct (_,u) -> u
   | _ -> EInstance.empty
 
+(* rocq2lean fork: record (source loc, coercion globref) at each INSERTED
+   coercion so a translator can splice the coercion explicitly at that span.
+   `coerce_cur_loc` is set by the loc-bearing entry points; `apply_coercion`
+   records each non-identity coercion it applies. `take_coercion_sites` drains
+   the buffer (used after pretyping one term). *)
+let coercion_sites : (Loc.t option * Names.GlobRef.t) list ref = ref []
+let coerce_cur_loc : Loc.t option ref = ref None
+let take_coercion_sites () =
+  let s = List.rev !coercion_sites in coercion_sites := []; s
+
 (* Apply coercion path from p to h of type hty; raise NoCoercion if not applicable *)
 let apply_coercion env sigma p h hty =
   let j, jty, trace, sigma =
     List.fold_left
       (fun (j,jty,trace,sigma) i ->
          let isid = i.coe_is_identity in
+         (if not isid then
+            coercion_sites := (!coerce_cur_loc, i.coe_value) :: !coercion_sites);
          let isproj = i.coe_is_projection in
          let sigma, c = Evd.fresh_global env sigma i.coe_value in
          let u = instance_of_global_constr sigma c in
@@ -721,6 +733,7 @@ let inh_coerce_to_fail ?(use_coercions=true) flags env sigma rigidonly v v_ty ta
       | None -> Exninfo.iraise (NoCoercion,info)
 
 let rec inh_conv_coerce_to_fail ?loc ?use_coercions env sigma ?(flags=default_flags_of env) rigidonly v t c1 =
+  coerce_cur_loc := loc;  (* rocq2lean fork: source loc for coercion_sites *)
   try (unify_leq_delay ~flags env sigma t c1, v, IdCoe)
   with UnableToUnify (best_failed_sigma,e) as exn ->
     let _, info = Exninfo.capture exn in

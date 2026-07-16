@@ -16,6 +16,10 @@ open Glob_term
 
 (** {6 Coercions. } *)
 
+(** rocq2lean fork: drain the (source loc, coercion globref) pairs recorded at
+    each INSERTED coercion during the most recent pretyping. *)
+val take_coercion_sites : unit -> (Loc.t option * GlobRef.t) list
+
 type coercion_trace
 
 val empty_coercion_trace : coercion_trace
