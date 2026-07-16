@@ -273,23 +273,35 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                       | _ -> ()) oib.Declarations.mind_consnames)
                     mib.Declarations.mind_packets) env ()
             with _ -> ());
-           (* rocq2lean: per-constant leading-binder telescope NAMES from the
-              DISCHARGED `const_type` — the authoritative signal for section-var
-              discharge. After `End Section`, `const_type` = ∀ (discharged section
-              vars) (source binders), …, so its leading binder names are
-              [discharged…] ++ [source…]. The translator computes k = (telescope
-              leading) − (source leading) and prepends the first k as EXPLICIT
-              binders (types recovered from its tracked section `variable`s BY
-              NAME), replacing the fragile theorem-only `@foo` pp elaboration for
-              defs/theorems/fixpoints alike. Emitted for EVERY this-file constant;
-              non-section constants have k=0 (telescope == source) → no-op. Names
-              from the same `decompose_prod`+`binder_name` the implicit_args block
-              uses; Anonymous → "_". *)
+           (* rocq2lean: per-constant leading-binder telescope from the DISCHARGED
+              `const_type` — the authoritative signal for section-var discharge.
+              After `End Section`, `const_type` = ∀ (discharged section vars)
+              (source binders), …, so its leading binders are [discharged…] ++
+              [source…]. The translator prepends the discharged prefix as binders
+              (types from its tracked section `variable`s BY NAME), replacing the
+              fragile theorem-only `@foo` pp elaboration for defs/theorems/fixpoints
+              alike. Emitted for EVERY this-file constant; non-section constants
+              have an empty discharged prefix → no-op. Each binder is
+              ["<name>", <impl_code>] where impl_code (same encoding as
+              implicit_args: 0=explicit, 1=rigid, 2=flex, 3=manual, +10 if maximal)
+              is Coq's AUTHORITATIVE implicit status for that binder — so the
+              consumer prepends with the RIGHT kind ({} / ⦃⦄ / explicit) with NO
+              guessing and NO verify-gate. Names/statuses from the same
+              `decompose_prod`+`implicits_of_global` the implicit_args block uses;
+              Anonymous → "_". *)
            Buffer.add_string buf "],\"discharged_telescopes\":[";
            (try
               let env = Global.env () in
               let this_mp = Names.ModPath.MPfile ldir in
               let firstd = ref true in
+              let code (s : Impargs.implicit_status) = match s with
+                | None -> 0
+                | Some info ->
+                  let base = (match info.Impargs.impl_expl with
+                   | Impargs.DepRigid _ | Impargs.DepFlexAndRigid _ -> 1
+                   | Impargs.DepFlex _ -> 2
+                   | Impargs.Manual -> 3) in
+                  base + (if Impargs.maximal_insertion_of s then 10 else 0) in
               Environ.fold_constants (fun c cb () ->
                 if Names.ModPath.equal (Names.Constant.modpath c) this_mp then begin
                   let (bnds, _) = Term.decompose_prod cb.Declarations.const_type in
@@ -298,11 +310,20 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                     match Context.binder_name annot with
                     | Names.Name id -> Names.Id.to_string id
                     | Names.Anonymous -> "_") bnds in
-                  if names <> [] then begin
+                  (* Impargs statuses are position-aligned with the leading binders
+                     (outermost-first); pad with explicit (0) past the known ones. *)
+                  let statuses = match Impargs.implicits_of_global (Names.GlobRef.ConstRef c) with
+                    | (_, ss) :: _ -> ss | [] -> [] in
+                  let rec zip ns ss = match ns, ss with
+                    | n :: ns', s :: ss' -> (n, code s) :: zip ns' ss'
+                    | n :: ns', [] -> (n, 0) :: zip ns' []
+                    | [], _ -> [] in
+                  let pairs = zip names statuses in
+                  if pairs <> [] then begin
                     if not !firstd then Buffer.add_char buf ',';
                     firstd := false;
                     let ns = String.concat ","
-                      (List.map (fun n -> Printf.sprintf "\"%s\"" (esc n)) names) in
+                      (List.map (fun (n, k) -> Printf.sprintf "[\"%s\",%d]" (esc n) k) pairs) in
                     Buffer.add_string buf
                       (Printf.sprintf "[\"%s\",[%s]]" (esc (Names.Constant.to_string c)) ns)
                   end
