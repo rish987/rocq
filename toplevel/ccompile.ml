@@ -343,6 +343,12 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
            (try
               let env = Global.env () in
               let this_mp = Names.ModPath.MPfile ldir in
+              (* A constant defined inside `Module Z` (BinIntDef's `Z.le`) has modpath
+                 `MPdot(MPfile …, "Z")`, NOT the bare file MPfile — so walk to the FILE
+                 root and compare, else every module-nested def is missed. *)
+              let rec mp_root = function
+                | Names.ModPath.MPdot (mp, _) -> mp_root mp
+                | mp -> mp in
               let evd = Evd.from_env env in
               let open Constrextern in
               let sv = (!print_implicits, !print_no_symbol, !print_coercions, !print_parentheses) in
@@ -350,7 +356,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
               print_coercions := true; print_parentheses := true;
               let firstt = ref true in
               Environ.fold_constants (fun c cb () ->
-                if Names.ModPath.equal (Names.Constant.modpath c) this_mp then begin
+                if Names.ModPath.equal (mp_root (Names.Constant.modpath c)) this_mp then begin
                   try
                     let ty = EConstr.of_constr cb.Declarations.const_type in
                     let raw = Pp.string_of_ppcmds (Printer.pr_econstr_env env evd ty) in
