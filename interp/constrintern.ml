@@ -625,6 +625,12 @@ let intern_assumption ~dump intern ntnvars env nal bk ty =
   match bk with
   | Default k ->
       let ty = intern_type env ty in
+      (* rocq2lean: binder/context types are interned in a SEPARATE call from the
+         term body, so the top-level `record_grefs` (in `intern_gen`) never folds
+         over them. Record here so binder-position refs are captured too — this is
+         the ONLY path axioms/parameters take (`do_assumptions` turns them into a
+         context), and it also fills definition binder types. *)
+      record_grefs ty;
       check_capture ty nal;
       let impls = impls_type_list 1 ty in
       List.fold_left
