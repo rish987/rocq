@@ -329,6 +329,41 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                   end
                 end) env ()
             with _ -> ());
+           (* rocq2lean: per-constant FULL resolved type from the DEFINITIVE kernel
+              `const_type`, keyed by name. The translator uses this to fill the
+              RETURN type of a definition whose source omits one (`Definition le
+              x y := (x ?= y) …` — no `: Prop`): without a return type the
+              stub+drop pass can't `sorry` it (nothing to infer against) so it
+              DROPS, and every reference to it (a Reals-stub axiom's `Z.le n m`)
+              then drops too. Consumer strips the def's own leading binders (by
+              arity) to get the codomain. Printed Set-Printing-All-ish (implicits
+              explicit, notations off) like `binder_types`, so it re-parses
+              unambiguously; newlines flattened to keep the JSON string valid. *)
+           Buffer.add_string buf "],\"resolved_types\":[";
+           (try
+              let env = Global.env () in
+              let this_mp = Names.ModPath.MPfile ldir in
+              let evd = Evd.from_env env in
+              let open Constrextern in
+              let sv = (!print_implicits, !print_no_symbol, !print_coercions, !print_parentheses) in
+              print_implicits := true; print_no_symbol := true;
+              print_coercions := true; print_parentheses := true;
+              let firstt = ref true in
+              Environ.fold_constants (fun c cb () ->
+                if Names.ModPath.equal (Names.Constant.modpath c) this_mp then begin
+                  try
+                    let ty = EConstr.of_constr cb.Declarations.const_type in
+                    let raw = Pp.string_of_ppcmds (Printer.pr_econstr_env env evd ty) in
+                    let str = String.map (fun ch -> if ch = '\n' || ch = '\r' then ' ' else ch) raw in
+                    if not !firstt then Buffer.add_char buf ',';
+                    firstt := false;
+                    Buffer.add_string buf
+                      (Printf.sprintf "[\"%s\",\"%s\"]" (esc (Names.Constant.to_string c)) (esc str))
+                  with _ -> ()
+                end) env ();
+              let (a,b,cc,d) = sv in
+              print_implicits := a; print_no_symbol := b; print_coercions := cc; print_parentheses := d
+            with _ -> ());
            Buffer.add_string buf "]}";
            let oc = open_out meta_file in
            output_string oc (Buffer.contents buf); close_out oc
