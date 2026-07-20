@@ -354,6 +354,16 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
               let sv = (!print_implicits, !print_no_symbol, !print_coercions, !print_parentheses) in
               print_implicits := true; print_no_symbol := true;
               print_coercions := true; print_parentheses := true;
+              (* Print every reference FULLY QUALIFIED (`Corelib.Init.Datatypes.bool`,
+                 not the nametab's shortest `bool`). A synthesized axiom's type is
+                 re-parsed with NO per-occurrence intern resolution, so a bare `bool`/
+                 `positive`/`prod` head has nothing to resolve against and drops
+                 (Lean has `Bool`/`Prod`, not `bool`/`prod`); the full path resolves
+                 to the ground corelib constant (or a fully-qualified config align). *)
+              let saved_ref = get_extern_reference () in
+              set_extern_reference (fun ?loc vars r ->
+                try Libnames.qualid_of_path ?loc (Nametab.path_of_global r)
+                with _ -> saved_ref ?loc vars r);
               let firstt = ref true in
               Environ.fold_constants (fun c cb () ->
                 if Names.ModPath.equal (mp_root (Names.Constant.modpath c)) this_mp then begin
@@ -367,6 +377,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                       (Printf.sprintf "[\"%s\",\"%s\"]" (esc (Names.Constant.to_string c)) (esc str))
                   with _ -> ()
                 end) env ();
+              set_extern_reference saved_ref;
               let (a,b,cc,d) = sv in
               print_implicits := a; print_no_symbol := b; print_coercions := cc; print_parentheses := d
             with _ -> ());
