@@ -658,6 +658,14 @@ let intern_cases_pattern_fwd = ref (fun _ -> failwith "intern_cases_pattern_fwd"
 let intern_letin_binder ~dump intern ntnvars env (({loc;v=na} as locna),def,ty) =
   let term = intern (reset_tmp_scope (restart_lambda_binders env)) def in
   let ty = Option.map (intern (set_type_scope (restart_prod_binders env))) ty in
+  (* rocq2lean: a CONTEXT-level let-binder (`Definition f (x := e : T) …`, a
+     `let` in a section/definition/theorem telescope) is interned HERE, in a
+     separate call from the term body, so the top-level `record_grefs` (in
+     `intern_gen`) never folds over its body `def` or its type annotation `ty`.
+     Record both so refs in context-let binders are captured too — analogous to
+     the `intern_assumption`/CLocalAssum coverage for `(x : T)` binders. *)
+  record_grefs term;
+  Option.iter record_grefs ty;
   let impls = impls_term_list 1 term in
   (push_name_env ~dump ntnvars impls env locna,
    (na,term,ty))
