@@ -381,6 +381,124 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
               let (a,b,cc,d) = sv in
               print_implicits := a; print_no_symbol := b; print_coercions := cc; print_parentheses := d
             with _ -> ());
+           (* rocq2lean PROTOTYPE: DETYPED glob_constr of each transparent
+              this-file constant's BODY, serialized in EXACTLY the shape
+              `petanque/intern` emits (serlib `glob_constr_to_yojson`) so the
+              translator's `translateGlob` consumes it verbatim. Context-free
+              (from the real compile's kernel term) — immune to the pet-at-scale
+              intern drop that loses e.g. `Bool.le`'s `_ = _`. Each entry:
+              ["<full const name>", <bodyGlobJSON>]. NOTE: detype materialises
+              ALL arguments (an implicit type arg becomes an explicit GRef, not
+              the `GHole GImplicitArg` intern emits) and drops source locs
+              (loc:null). *)
+           Buffer.add_string buf "],\"detyped_globs\":[";
+           (try
+              let env = Global.env () in
+              let this_mp = Names.ModPath.MPfile ldir in
+              let rec mp_root = function
+                | Names.ModPath.MPdot (mp, _) -> mp_root mp
+                | mp -> mp in
+              let evd = Evd.from_env env in
+              (* --- serlib-format glob_constr -> JSON (matched against a real
+                 petanque/intern capture of `Bool.le`) --- *)
+              let jstr s = "\"" ^ esc s ^ "\"" in
+              let jarr l = "[" ^ String.concat "," l ^ "]" in
+              let jid id = jarr [jstr "Id"; jstr (Names.Id.to_string id)] in
+              let jlbl l = jarr [jstr "Id"; jstr (Names.Label.to_string l)] in
+              let jdirpath dp =
+                jarr [jstr "DirPath"; jarr (List.map jid (Names.DirPath.repr dp))] in
+              let rec jmodpath = function
+                | Names.ModPath.MPfile dp -> jarr [jstr "MPfile"; jdirpath dp]
+                | Names.ModPath.MPbound _ as mp ->
+                    jarr [jstr "MPbound"; jstr (Names.ModPath.to_string mp)]
+                | Names.ModPath.MPdot (mp, l) ->
+                    jarr [jstr "MPdot"; jmodpath mp; jlbl l] in
+              let jkername kn =
+                let mp, l = Names.KerName.repr kn in
+                jarr [jstr "KerName"; jmodpath mp; jlbl l] in
+              let jconstant c =
+                let cu = Names.Constant.user c and cc = Names.Constant.canonical c in
+                if Names.KerName.equal cu cc
+                then jarr [jstr "Constant"; jkername cu; "null"]
+                else jarr [jstr "Constant"; jkername cu; jkername cc] in
+              let jmutind mi =
+                let cu = Names.MutInd.user mi and cc = Names.MutInd.canonical mi in
+                if Names.KerName.equal cu cc
+                then jarr [jstr "MutInd"; jkername cu; "null"]
+                else jarr [jstr "MutInd"; jkername cu; jkername cc] in
+              let jind (mi, i) = jarr [jmutind mi; string_of_int i] in
+              let jconstruct (ind, j) = jarr [jind ind; string_of_int j] in
+              let jgref = function
+                | Names.GlobRef.VarRef id -> jarr [jstr "VarRef"; jid id]
+                | Names.GlobRef.ConstRef c -> jarr [jstr "ConstRef"; jconstant c]
+                | Names.GlobRef.IndRef ind -> jarr [jstr "IndRef"; jind ind]
+                | Names.GlobRef.ConstructRef cs -> jarr [jstr "ConstructRef"; jconstruct cs] in
+              let jname = function
+                | Names.Name.Anonymous -> jarr [jstr "Anonymous"]
+                | Names.Name.Name id -> jarr [jstr "Name"; jid id] in
+              let jbk = function
+                | Glob_term.Explicit -> jarr [jstr "Explicit"]
+                | Glob_term.MaxImplicit -> jarr [jstr "MaxImplicit"]
+                | Glob_term.NonMaxImplicit -> jarr [jstr "NonMaxImplicit"] in
+              let wrap node = "{\"v\":" ^ node ^ ",\"loc\":null}" in
+              let rec jg gc = wrap (jnode (DAst.get gc))
+              and jnode = function
+                | Glob_term.GRef (gr, _) -> jarr [jstr "GRef"; jgref gr; "null"]
+                | Glob_term.GVar id -> jarr [jstr "GVar"; jid id]
+                | Glob_term.GApp (f, args) ->
+                    jarr [jstr "GApp"; jg f; jarr (List.map jg args)]
+                | Glob_term.GLambda (na, _, bk, t, b) ->
+                    jarr [jstr "GLambda"; jname na; "null"; jbk bk; jg t; jg b]
+                | Glob_term.GProd (na, _, bk, t, b) ->
+                    jarr [jstr "GProd"; jname na; "null"; jbk bk; jg t; jg b]
+                | Glob_term.GLetIn (na, _, d, ty, b) ->
+                    let tyj = match ty with None -> "null" | Some t -> jg t in
+                    jarr [jstr "GLetIn"; jname na; "null"; jg d; tyj; jg b]
+                | Glob_term.GCases (_, _, tomatch, clauses) ->
+                    let jtom (scrut, (na, _)) =
+                      jarr [jg scrut; jarr [jname na; "null"]] in
+                    let jclause cl =
+                      let (ids, pats, body) = cl.CAst.v in
+                      "{\"v\":" ^ jarr [ jarr (List.map jid ids);
+                                         jarr (List.map jpat pats); jg body ]
+                        ^ ",\"loc\":null}" in
+                    jarr [jstr "GCases"; jarr [jstr "RegularStyle"]; "null";
+                          jarr (List.map jtom tomatch); jarr (List.map jclause clauses)]
+                | Glob_term.GIf (c, (na, _), t, e) ->
+                    jarr [jstr "GIf"; jg c; jarr [jname na; "null"]; jg t; jg e]
+                | Glob_term.GLetTuple (nas, (na, _), sc, b) ->
+                    jarr [jstr "GLetTuple"; jarr (List.map jname nas);
+                          jarr [jname na; "null"]; jg sc; jg b]
+                | Glob_term.GSort _ -> jarr [jstr "GSort"; "null"]
+                | Glob_term.GHole _ -> jarr [jstr "GHole"; jarr [jstr "GInternalHole"]]
+                | Glob_term.GProj (_, args, c) ->
+                    jarr (jstr "GApp" :: jg c :: [jarr (List.map jg args)])
+                | Glob_term.GInt _ | Glob_term.GFloat _ | Glob_term.GString _ ->
+                    jarr [jstr "GHole"; jarr [jstr "GInternalHole"]]
+                | _ -> jarr [jstr "GHole"; jarr [jstr "GInternalHole"]]
+              and jpat p =
+                match DAst.get p with
+                | Glob_term.PatVar na ->
+                    "{\"v\":" ^ jarr [jstr "PatVar"; jname na] ^ ",\"loc\":null}"
+                | Glob_term.PatCstr (cstr, subs, na) ->
+                    "{\"v\":" ^ jarr [jstr "PatCstr"; jconstruct cstr;
+                                      jarr (List.map jpat subs); jname na]
+                      ^ ",\"loc\":null}" in
+              let firstg = ref true in
+              Environ.fold_constants (fun c cb () ->
+                if Names.ModPath.equal (mp_root (Names.Constant.modpath c)) this_mp then
+                  match cb.Declarations.const_body with
+                  | Declarations.Def body ->
+                    (try
+                       let gc = Detyping.detype Detyping.Now env evd (EConstr.of_constr body) in
+                       let j = jg gc in
+                       if not !firstg then Buffer.add_char buf ',';
+                       firstg := false;
+                       Buffer.add_string buf
+                         (Printf.sprintf "[\"%s\",%s]" (esc (Names.Constant.to_string c)) j)
+                     with _ -> ())
+                  | _ -> ()) env ()
+            with _ -> ());
            Buffer.add_string buf "]}";
            let oc = open_out meta_file in
            output_string oc (Buffer.contents buf); close_out oc
