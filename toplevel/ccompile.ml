@@ -490,7 +490,23 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                   match cb.Declarations.const_body with
                   | Declarations.Def body ->
                     (try
-                       let gc = Detyping.detype Detyping.Now env evd (EConstr.of_constr body) in
+                       (* rocq2lean: force RAW-PRINT detype so a 2-ctor
+                          match (e.g. bool) is emitted as a real `GCases`
+                          (RegularStyle, carrying the constructor names via
+                          `PatCstr` ConstructRefs) rather than Coq's if-sugar
+                          `GIf` — the latter renders to a Lean `if` that needs
+                          a `Decidable` instance the ground-translated `bool`
+                          lacks, so `Bool.le` & its ~1232 refs fail to
+                          elaborate. `raw_print` also bypasses the
+                          factorize/default-clause synthesis (detype_eqns'
+                          build_tree path), giving clean per-constructor
+                          clauses that match `petanque/intern`'s glob — the
+                          shape the translator's `translateGlob` was built for.
+                          Non-`match` node shapes are unaffected. *)
+                       let gc =
+                         Flags.with_option Flags.raw_print
+                           (Detyping.detype Detyping.Now env evd)
+                           (EConstr.of_constr body) in
                        let j = jg gc in
                        if not !firstg then Buffer.add_char buf ',';
                        firstg := false;
