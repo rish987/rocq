@@ -513,7 +513,30 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                        Buffer.add_string buf
                          (Printf.sprintf "[\"%s\",%s]" (esc (Names.Constant.to_string c)) j)
                      with _ -> ())
-                  | _ -> ()) env ()
+                  | _ -> ()) env ();
+              (* rocq2lean: TYPE globs — detype each this-file constant's
+                 `const_type` (its STATEMENT), for EVERY constant regardless of
+                 body kind. Theorems/lemmas have opaque (proof) bodies, so they
+                 emit NO `detyped_globs` entry, yet their `const_type` IS the
+                 statement we want — this recovers theorem statements that DROP
+                 on a notation the fragile per-statement live-intern couldn't
+                 render (`_ = _`, `~ _`, sig, …). Same serializer (`jg`), same
+                 `raw_print` (dependent types can carry `match`es). *)
+              Buffer.add_string buf "],\"detyped_type_globs\":[";
+              let firstt = ref true in
+              Environ.fold_constants (fun c cb () ->
+                if Names.ModPath.equal (mp_root (Names.Constant.modpath c)) this_mp then
+                  (try
+                     let gc =
+                       Flags.with_option Flags.raw_print
+                         (Detyping.detype Detyping.Now env evd)
+                         (EConstr.of_constr cb.Declarations.const_type) in
+                     let j = jg gc in
+                     if not !firstt then Buffer.add_char buf ',';
+                     firstt := false;
+                     Buffer.add_string buf
+                       (Printf.sprintf "[\"%s\",%s]" (esc (Names.Constant.to_string c)) j)
+                   with _ -> ())) env ()
             with _ -> ());
            Buffer.add_string buf "]}";
            let oc = open_out meta_file in
