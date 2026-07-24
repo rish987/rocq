@@ -536,7 +536,42 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                      firstt := false;
                      Buffer.add_string buf
                        (Printf.sprintf "[\"%s\",%s]" (esc (Names.Constant.to_string c)) j)
-                   with _ -> ())) env ()
+                   with _ -> ())) env ();
+              (* rocq2lean: detyped INDUCTIVES — arity + per-constructor types, so a
+                 Record/inductive that DROPS on an unrenderable field notation
+                 (Morphisms `respectful` `_ ==> _`, …) can be rendered FAITHFULLY from
+                 the kernel. `fold_constants` misses inductives (not constants), so fold
+                 the inductive blocks. Types are FULL (params as leading ∀-binders, via
+                 `type_of_inductive`/`type_of_constructors`); the consumer strips the
+                 first <nparams> to form the Lean `inductive` header. Entry:
+                 ["<full ind name>", <nparams>, <arityGlob>, [["<ctor>",<ctorTyGlob>],…]]. *)
+              Buffer.add_string buf "],\"detyped_inductives\":[";
+              let firsti = ref true in
+              Environ.fold_inductives (fun mind mib () ->
+                if Names.ModPath.equal (Names.MutInd.modpath mind) this_mp then
+                  Array.iteri (fun i oib ->
+                    (try
+                       let univ = UVars.Instance.empty in
+                       let ind_ty = Inductive.type_of_inductive ((mib, oib), univ) in
+                       let ctor_tys = Inductive.type_of_constructors ((mind, i), univ) (mib, oib) in
+                       let ind_name =
+                         Names.ModPath.to_string (Names.MutInd.modpath mind) ^ "."
+                         ^ Names.Id.to_string oib.Declarations.mind_typename in
+                       let dj t = jg (Flags.with_option Flags.raw_print
+                                        (Detyping.detype Detyping.Now env evd)
+                                        (EConstr.of_constr t)) in
+                       let arity_g = dj ind_ty in
+                       let ctors_j = String.concat "," (Array.to_list (Array.mapi (fun j cty ->
+                         Printf.sprintf "[\"%s\",%s]"
+                           (esc (Names.Id.to_string oib.Declarations.mind_consnames.(j)))
+                           (dj cty)) ctor_tys)) in
+                       if not !firsti then Buffer.add_char buf ',';
+                       firsti := false;
+                       Buffer.add_string buf
+                         (Printf.sprintf "[\"%s\",%d,%s,[%s]]"
+                            (esc ind_name) mib.Declarations.mind_nparams arity_g ctors_j)
+                     with _ -> ()))
+                    mib.Declarations.mind_packets) env ()
             with _ -> ());
            Buffer.add_string buf "]}";
            let oc = open_out meta_file in
