@@ -469,7 +469,15 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 | Glob_term.GLetTuple (nas, (na, _), sc, b) ->
                     jarr [jstr "GLetTuple"; jarr (List.map jname nas);
                           jarr [jname na; "null"]; jg sc; jg b]
-                | Glob_term.GSort _ -> jarr [jstr "GSort"; "null"]
+                | Glob_term.GSort (_, u) ->
+                    (* rocq2lean: keep the sort family so the consumer renders the right
+                       Lean sort (Prop/Type), instead of defaulting everything to Type. *)
+                    let sname = (match u with
+                      | Glob_term.UNamed [(Glob_term.GProp, _)]  -> "Prop"
+                      | Glob_term.UNamed [(Glob_term.GSProp, _)] -> "SProp"
+                      | Glob_term.UNamed [(Glob_term.GSet, _)]   -> "Set"
+                      | _                                        -> "Type") in
+                    jarr [jstr "GSort"; jstr sname]
                 | Glob_term.GHole _ -> jarr [jstr "GHole"; jarr [jstr "GInternalHole"]]
                 | Glob_term.GProj (_, args, c) ->
                     jarr (jstr "GApp" :: jg c :: [jarr (List.map jg args)])
@@ -571,7 +579,26 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                          (Printf.sprintf "[\"%s\",%d,%s,[%s]]"
                             (esc ind_name) mib.Declarations.mind_nparams arity_g ctors_j)
                      with _ -> ()))
-                    mib.Declarations.mind_packets) env ()
+                    mib.Declarations.mind_packets) env ();
+              (* rocq2lean: whole INTERNED glob of each top-level expression the real
+                 compile interned, keyed by source span [bp, ep, <glob>]. The compile-
+                 time reliable expansion AST (notations expanded, scopes resolved) that
+                 replaces the pet fork's fragile per-statement intern. Same serializer
+                 (`jg`) as the detyped globs — but these are INTERNED (source→glob), so
+                 they keep parsed sorts + source structure, unlike detype. *)
+              Buffer.add_string buf "],\"interned_globs\":[";
+              let firstn = ref true in
+              List.iter (fun (loc, g) ->
+                match loc with
+                | Some l ->
+                    (try
+                       let (bp, ep) = Loc.unloc l in
+                       let j = jg g in
+                       if not !firstn then Buffer.add_char buf ',';
+                       firstn := false;
+                       Buffer.add_string buf (Printf.sprintf "[%d,%d,%s]" bp ep j)
+                     with _ -> ())
+                | None -> ()) (Constrintern.take_interned_globs ())
             with _ -> ());
            Buffer.add_string buf "]}";
            let oc = open_out meta_file in

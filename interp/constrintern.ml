@@ -563,6 +563,19 @@ let take_generalizing_binders () =
 let ref_resolutions : (Loc.t option * Names.GlobRef.t) list ref = ref []
 let take_ref_resolutions () =
   let s = List.rev !ref_resolutions in ref_resolutions := []; s
+(* rocq2lean: the WHOLE interned `glob_constr` of each top-level expression the real
+   compile interns (a definition body, a theorem/field type, …), keyed by its source
+   loc. This is the COMPILE-TIME, boot-reliable form of the pet fork's per-statement
+   `petanque/intern` — the real compile interns every declaration successfully (section
+   vars in scope, no proof-text slice-bleed), so notations are already expanded (`x ==> y`
+   → `respectful x y`), scopes resolved, and source spans preserved. The consumer renders
+   a declaration from its interned glob instead of re-interning per-statement via pet.
+   Gated on ROCQ2LEAN_META so ordinary compiles pay nothing. Drained by
+   `take_interned_globs`, dumped to `.r2lmeta.json`. *)
+let r2l_meta_on = lazy (Sys.getenv_opt "ROCQ2LEAN_META" <> None)
+let interned_globs : (Loc.t option * Glob_term.glob_constr) list ref = ref []
+let take_interned_globs () =
+  let s = List.rev !interned_globs in interned_globs := []; s
 (* rocq2lean: resolved SOURCE-BINDER types, keyed by the binder's source loc.
    Recorded by `comDefinition` after a definition's body is pretyped (evars
    resolved), so an UNTYPED binder (`Definition valid_binary x := …`) carries its
@@ -2763,6 +2776,7 @@ let intern_gen kind env sigma
                      impls; binder_block_names = Some k; ntn_binding_ids = Id.Set.empty}
       pattern_mode (ltacvars, Id.Map.empty) c
   in
+  if Lazy.force r2l_meta_on then interned_globs := (r.CAst.loc, r) :: !interned_globs;
   record_grefs r; r
 
 let intern_unknown_if_term_or_type env sigma c =

@@ -61,6 +61,9 @@ val take_generalizing_binders : unit -> (Loc.t option * bool * Id.t list) list
    (span, GlobRef) accumulated during internalization — every GRef in every
    interned term, including notation-expanded heads. *)
 val take_ref_resolutions : unit -> (Loc.t option * Names.GlobRef.t) list
+(* rocq2lean fork: drain the whole interned glob_constr of each top-level intern,
+   keyed by source loc (the compile-time reliable form of pet's per-statement intern). *)
+val take_interned_globs : unit -> (Loc.t option * Glob_term.glob_constr) list
 val take_binder_types : unit -> (Loc.t option * string) list
 val record_binder_type : Loc.t option -> string -> unit
 
