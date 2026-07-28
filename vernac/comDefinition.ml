@@ -122,15 +122,33 @@ let interp_definition ~program_mode env evd impl_env bl red_option c ctypopt =
      let sv = (!print_implicits, !print_no_symbol, !print_coercions, !print_parentheses) in
      print_implicits := true; print_no_symbol := true;
      print_coercions := true; print_parentheses := true;
+     (* Print every reference FULLY QUALIFIED (`Corelib.Init.Datatypes.nat`, not the
+        nametab's shortest `nat`) — the SAME mechanism `resolved_types` uses in
+        `ccompile.ml`. A recovered binder type is re-parsed by the translator with NO
+        per-occurrence intern resolution behind it, so a bare `nat`/`Z`/`string` head
+        has nothing to resolve against: it can neither match a fully-qualified
+        alignment key nor be told apart from a library's OWN same-named declaration.
+        The full path resolves unambiguously to the ground constant (or to a
+        fully-qualified config align). *)
+     let saved_ref = get_extern_reference () in
+     set_extern_reference (fun ?loc vars r ->
+       try Libnames.qualid_of_path ?loc (Nametab.path_of_global r)
+       with _ -> saved_ref ?loc vars r);
      (try ignore (List.fold_right2 (fun decl loc penv ->
         (match loc with
          | None -> ()
          | Some _ ->
            let ty = Evarutil.nf_evar evd (Context.Rel.Declaration.get_type decl) in
-           let str = Pp.string_of_ppcmds (Printer.pr_econstr_env penv evd ty) in
+           let raw = Pp.string_of_ppcmds (Printer.pr_econstr_env penv evd ty) in
+           (* Flatten every control character to a space (as `resolved_types` does):
+              fully-qualified names are long, so the pretty-printer WRAPS and emits
+              newlines — which are invalid inside a JSON string and made the whole
+              sidecar unparseable, silently costing the file ALL of its metadata. *)
+           let str = String.map (fun ch -> if Char.code ch < 0x20 then ' ' else ch) raw in
            Constrintern.record_binder_type loc str);
         EConstr.push_rel decl penv) ctx r2l_locs env_bl)
       with _ -> ());
+     set_extern_reference saved_ref;
      let (a,b,c,d) = sv in
      print_implicits := a; print_no_symbol := b; print_coercions := c; print_parentheses := d
    end);
