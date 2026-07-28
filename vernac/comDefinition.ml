@@ -140,10 +140,9 @@ let interp_definition ~program_mode env evd impl_env bl red_option c ctypopt =
          | Some _ ->
            let ty = Evarutil.nf_evar evd (Context.Rel.Declaration.get_type decl) in
            let raw = Pp.string_of_ppcmds (Printer.pr_econstr_env penv evd ty) in
-           (* Flatten every control character to a space (as `resolved_types` does):
-              fully-qualified names are long, so the pretty-printer WRAPS and emits
-              newlines — which are invalid inside a JSON string and made the whole
-              sidecar unparseable, silently costing the file ALL of its metadata. *)
+           (* Newlines (the pretty-printer wraps long qualified names) are escaped
+              properly by `esc` in `ccompile.ml`; flatten them to spaces anyway so the
+              recorded value stays single-line and readable. *)
            let str = String.map (fun ch -> if Char.code ch < 0x20 then ' ' else ch) raw in
            Constrintern.record_binder_type loc str);
         EConstr.push_rel decl penv) ctx r2l_locs env_bl)

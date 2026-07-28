@@ -83,11 +83,25 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
          try
            let sites = Coercion.take_coercion_sites () in
            let meta_file = safe_chop_extension long_f_dot_out ^ ".r2lmeta.json" in
+           (* JSON string escaper. MUST cover every character JSON forbids raw
+              inside a string, not just the quote and backslash: a stray control
+              char (a newline from the pretty-printer wrapping a long type, a tab
+              in a comment) makes the WHOLE document unparseable, and the consumer
+              swallows that failure and proceeds with NO metadata for the file.
+              Applies to every string emitted here, including the identifiers
+              inside the structured globs (jstr routes through this). *)
            let esc s =
              let b = Buffer.create (String.length s + 2) in
              String.iter (fun c -> match c with
                | '"'  -> Buffer.add_string b "\\\""
                | '\\' -> Buffer.add_string b "\\\\"
+               | '\n' -> Buffer.add_string b "\\n"
+               | '\r' -> Buffer.add_string b "\\r"
+               | '\t' -> Buffer.add_string b "\\t"
+               | '\b' -> Buffer.add_string b "\\b"
+               | '\012' -> Buffer.add_string b "\\f"
+               | c when Char.code c < 0x20 || Char.code c = 0x7f ->
+                 Buffer.add_string b (Printf.sprintf "\\u%04x" (Char.code c))
                | c    -> Buffer.add_char b c) s;
              Buffer.contents b in
            let buf = Buffer.create 256 in
