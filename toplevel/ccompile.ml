@@ -105,17 +105,38 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                | c    -> Buffer.add_char b c) s;
              Buffer.contents b in
            let buf = Buffer.create 256 in
+           (* rocq2lean: a GlobRef's FULLY QUALIFIED name. `Printer.pr_global` gives
+              the nametab's SHORTEST name (`ANum`), which the consumer can neither
+              match against a fully-qualified alignment key nor tell apart from a
+              same-short-named declaration elsewhere — the same bareness defect
+              already fixed for `binder_types`/`resolved_types`. Constructors are
+              named Lean-style (UNDER the inductive: `…BinNums.Z.Z0`), matching
+              `ref_resolutions`, because that is the form the translator resolves. *)
+           let r2l_gref_name env = function
+             | Names.GlobRef.VarRef id -> Names.Id.to_string id
+             | Names.GlobRef.ConstRef c -> Names.Constant.to_string c
+             | Names.GlobRef.IndRef (mind, i) ->
+                 let mib = Environ.lookup_mind mind env in
+                 Names.ModPath.to_string (Names.MutInd.modpath mind) ^ "." ^
+                 Names.Id.to_string mib.Declarations.mind_packets.(i).Declarations.mind_typename
+             | Names.GlobRef.ConstructRef ((mind, i), j) ->
+                 let mib = Environ.lookup_mind mind env in
+                 Names.ModPath.to_string (Names.MutInd.modpath mind) ^ "." ^
+                 Names.Id.to_string mib.Declarations.mind_packets.(i).Declarations.mind_typename ^ "." ^
+                 Names.Id.to_string mib.Declarations.mind_packets.(i).Declarations.mind_consnames.(j-1) in
            Buffer.add_string buf "{\"coercions\":[";
            let first = ref true in
+           let coe_env = Global.env () in
            List.iter (fun (loc, gref) ->
              match loc with
              | Some l ->
                let (bp, ep) = Loc.unloc l in
+               let nm = (try r2l_gref_name coe_env gref
+                         with _ -> Pp.string_of_ppcmds (Printer.pr_global gref)) in
                if not !first then Buffer.add_char buf ',';
                first := false;
                Buffer.add_string buf
-                 (Printf.sprintf "[%d,%d,\"%s\"]" bp ep
-                    (esc (Pp.string_of_ppcmds (Printer.pr_global gref))))
+                 (Printf.sprintf "[%d,%d,\"%s\"]" bp ep (esc nm))
              | None -> ()) sites;
            (* rocq2lean: generalizing-binder generated vars per span —
               [bp, ep, is_impl(0/1), ["A","R",...]]. *)
@@ -566,11 +587,18 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                  the inductive blocks. Types are FULL (params as leading ∀-binders, via
                  `type_of_inductive`/`type_of_constructors`); the consumer strips the
                  first <nparams> to form the Lean `inductive` header. Entry:
-                 ["<full ind name>", <nparams>, <arityGlob>, [["<ctor>",<ctorTyGlob>],…]]. *)
+                 ["<full ind name>", <nparams>, <arityGlob>, [["<ctor>",<ctorTyGlob>],…]].
+                 Compare the modpath's FILE ROOT (`mp_root`), exactly as the constant
+                 folds do: an inductive declared inside a `Module` (SF's `Module
+                 BreakImp.` → `LF.Imp.BreakImp.ceval`, BinNums' `Module Z`) has modpath
+                 `MPdot(MPfile …, "BreakImp")`, so a direct comparison silently omits
+                 every module-nested inductive — and its consumers (`recoverCtorBinders`,
+                 `recoverInductiveParams`) then leave the constructor binders as HOLES,
+                 which Lean unifies to the wrong type. *)
               Buffer.add_string buf "],\"detyped_inductives\":[";
               let firsti = ref true in
               Environ.fold_inductives (fun mind mib () ->
-                if Names.ModPath.equal (Names.MutInd.modpath mind) this_mp then
+                if Names.ModPath.equal (mp_root (Names.MutInd.modpath mind)) this_mp then
                   Array.iteri (fun i oib ->
                     (try
                        let univ = UVars.Instance.empty in
@@ -612,7 +640,30 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                        firstn := false;
                        Buffer.add_string buf (Printf.sprintf "[%d,%d,%s]" bp ep j)
                      with _ -> ())
-                | None -> ()) (Constrintern.take_interned_globs ())
+                | None -> ()) (Constrintern.take_interned_globs ());
+              (* rocq2lean: STRUCTURED twin of `binder_types` — the per-SPAN resolved
+                 type of each source binder, as a detyped glob instead of a printed
+                 string [bp, ep, <glob>]. Recorded by `comDefinition` in the same env
+                 as the string form (see `record_binder_type_glob`). The string key is
+                 kept alongside during the consumer migration. Deduped by span, like
+                 `binder_types`. *)
+              Buffer.add_string buf "],\"binder_type_globs\":[";
+              let seenbg = Hashtbl.create 997 in
+              let firstbg = ref true in
+              List.iter (fun (loc, g) ->
+                match loc with
+                | Some l ->
+                    (try
+                       let (bp, ep) = Loc.unloc l in
+                       if not (Hashtbl.mem seenbg (bp, ep)) then begin
+                         Hashtbl.add seenbg (bp, ep) ();
+                         let j = jg g in
+                         if not !firstbg then Buffer.add_char buf ',';
+                         firstbg := false;
+                         Buffer.add_string buf (Printf.sprintf "[%d,%d,%s]" bp ep j)
+                       end
+                     with _ -> ())
+                | None -> ()) (Constrintern.take_binder_type_globs ())
             with _ -> ());
            Buffer.add_string buf "]}";
            let oc = open_out meta_file in

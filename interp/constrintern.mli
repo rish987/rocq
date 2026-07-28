@@ -66,6 +66,11 @@ val take_ref_resolutions : unit -> (Loc.t option * Names.GlobRef.t) list
 val take_interned_globs : unit -> (Loc.t option * Glob_term.glob_constr) list
 val take_binder_types : unit -> (Loc.t option * string) list
 val record_binder_type : Loc.t option -> string -> unit
+(* rocq2lean fork: STRUCTURED twin of the above — the per-span resolved binder type
+   as a detyped glob_constr (kernames by construction, no notation layer), so the
+   consumer needs no print/re-parse round trip. *)
+val take_binder_type_globs : unit -> (Loc.t option * Glob_term.glob_constr) list
+val record_binder_type_glob : Loc.t option -> Glob_term.glob_constr -> unit
 
 val empty_internalization_env : internalization_env
 

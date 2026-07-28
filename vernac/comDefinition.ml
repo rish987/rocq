@@ -144,7 +144,21 @@ let interp_definition ~program_mode env evd impl_env bl red_option c ctypopt =
               properly by `esc` in `ccompile.ml`; flatten them to spaces anyway so the
               recorded value stays single-line and readable. *)
            let str = String.map (fun ch -> if Char.code ch < 0x20 then ' ' else ch) raw in
-           Constrintern.record_binder_type loc str);
+           Constrintern.record_binder_type loc str;
+           (* rocq2lean: also record the STRUCTURED form — the DETYPED glob of the
+              same resolved type, in the same env the string is printed in. The
+              printed string has to be re-parsed by the consumer through a fresh
+              intern (no scope context, notations re-applied); a glob carries
+              kernames by construction and has no notation layer, so the consumer
+              renders it directly. `raw_print` for the same reason `ccompile`'s
+              detyped keys use it: no `if`-sugar and no clause factorisation, which
+              is the shape the translator's glob renderer expects. Guarded
+              independently so a detype failure cannot lose the string entry. *)
+           (try
+              let g = Flags.with_option Flags.raw_print
+                        (Detyping.detype Detyping.Now penv evd) ty in
+              Constrintern.record_binder_type_glob loc g
+            with _ -> ()));
         EConstr.push_rel decl penv) ctx r2l_locs env_bl)
       with _ -> ());
      set_extern_reference saved_ref;

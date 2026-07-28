@@ -586,6 +586,18 @@ let binder_types : (Loc.t option * string) list ref = ref []
 let take_binder_types () =
   let s = List.rev !binder_types in binder_types := []; s
 let record_binder_type loc s = binder_types := (loc, s) :: !binder_types
+(* rocq2lean: STRUCTURED twin of `binder_types` — the same per-span resolved binder
+   type, but as the DETYPED `glob_constr` instead of a pretty-printed string. The
+   string transport is lossy in both directions: the printer applies notations and
+   (without the extern-reference override) the nametab's shortest name, and the
+   consumer then has to re-PARSE it through a fresh intern with no scope context. A
+   glob carries kernames by construction and no notation layer, so the consumer
+   renders it directly. Recorded alongside the string by `comDefinition`; drained by
+   `take_binder_type_globs` and dumped as the `binder_type_globs` sidecar key. *)
+let binder_type_globs : (Loc.t option * Glob_term.glob_constr) list ref = ref []
+let take_binder_type_globs () =
+  let s = List.rev !binder_type_globs in binder_type_globs := []; s
+let record_binder_type_glob loc g = binder_type_globs := (loc, g) :: !binder_type_globs
 let rec record_grefs c =
   (match DAst.get c with
    | GRef (r, _) -> ref_resolutions := (c.CAst.loc, r) :: !ref_resolutions
