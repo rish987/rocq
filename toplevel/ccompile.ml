@@ -105,6 +105,38 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                | c    -> Buffer.add_char b c) s;
              Buffer.contents b in
            let buf = Buffer.create 256 in
+           (* rocq2lean: every MutInd this file's emitted metadata REFERENCES, keyed
+              by the string the consumer reconstructs from the serialized kername
+              (`".".intercalate (globIds <MutInd>)`, i.e. [file dirpath INNERMOST-
+              first…, submodules…, label] — `LF.Imp.com` ↦ `Imp.LF.com`). Populated
+              as a side effect of serializing/naming refs (see `r2l_note_mind` in
+              `jmutind` and `r2l_note_gref` at the gref-name sites), so its scope is
+              exactly "inductives REFERENCED by this file" — NOT the whole loaded
+              environment (the corelib closure would be thousands of entries per
+              file). Drained at the end into the `inductive_ctor_names` key. *)
+           let r2l_minds : (string, Names.MutInd.t) Hashtbl.t = Hashtbl.create 97 in
+           (* The consumer's key: flatten the USER kername's `Id`/`Label` leaves in
+              serialization order, exactly as `Rocq2Lean.Translate.globIds` does
+              (`MPfile` contributes `DirPath.repr`, innermost-first; `MPdot` appends
+              its label; `MPbound` is serialized as a plain string and so contributes
+              NO id leaf). Canonical half is deliberately ignored — `globIds` keeps
+              only the user name for a `MutInd` KerPair. *)
+           let r2l_mind_key mi =
+             let kn = Names.MutInd.user mi in
+             let mp, lbl = Names.KerName.repr kn in
+             let rec ids = function
+               | Names.ModPath.MPfile dp ->
+                   List.map Names.Id.to_string (Names.DirPath.repr dp)
+               | Names.ModPath.MPbound _ -> []
+               | Names.ModPath.MPdot (mp, l) -> ids mp @ [Names.Label.to_string l] in
+             String.concat "." (ids mp @ [Names.Label.to_string lbl]) in
+           let r2l_note_mind mi =
+             let k = r2l_mind_key mi in
+             if not (Hashtbl.mem r2l_minds k) then Hashtbl.add r2l_minds k mi in
+           let r2l_note_gref = function
+             | Names.GlobRef.IndRef (mi, _)
+             | Names.GlobRef.ConstructRef ((mi, _), _) -> (try r2l_note_mind mi with _ -> ())
+             | _ -> () in
            (* rocq2lean: a GlobRef's FULLY QUALIFIED name. `Printer.pr_global` gives
               the nametab's SHORTEST name (`ANum`), which the consumer can neither
               match against a fully-qualified alignment key nor tell apart from a
@@ -131,6 +163,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
              match loc with
              | Some l ->
                let (bp, ep) = Loc.unloc l in
+               r2l_note_gref gref;
                let nm = (try r2l_gref_name coe_env gref
                          with _ -> Pp.string_of_ppcmds (Printer.pr_global gref)) in
                if not !first then Buffer.add_char buf ',';
@@ -186,6 +219,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 match loc with
                 | Some l ->
                   let (bp, ep) = Loc.unloc l in
+                  r2l_note_gref gref;
                   if not (Hashtbl.mem seen (bp, ep)) then begin
                     Hashtbl.add seen (bp, ep) ();
                     if not !firstr then Buffer.add_char buf ',';
@@ -457,6 +491,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 then jarr [jstr "Constant"; jkername cu; "null"]
                 else jarr [jstr "Constant"; jkername cu; jkername cc] in
               let jmutind mi =
+                r2l_note_mind mi;
                 let cu = Names.MutInd.user mi and cc = Names.MutInd.canonical mi in
                 if Names.KerName.equal cu cc
                 then jarr [jstr "MutInd"; jkername cu; "null"]
@@ -664,6 +699,47 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                        end
                      with _ -> ())
                 | None -> ()) (Constrintern.take_binder_type_globs ())
+            with _ -> ());
+           (* rocq2lean: SPAN-FREE ordered CONSTRUCTOR NAMES per referenced inductive.
+              Every other ctor-naming key here is per-OCCURRENCE and SPAN-keyed
+              (`ref_resolutions`), which is unusable for a DETYPED glob's
+              `ConstructRef`: detype drops locs, so there is no span to match and the
+              consumer is left with (inductive kername, 1-based INDEX) and no name —
+              and mapping Coq's index onto Lean's n-th constructor is unsound the
+              moment the two declaration orders differ (`bool := true | false` vs
+              `Bool := false | true`). `Environ.lookup_mind` on the LOADED environment
+              gives Coq's OWN `mind_consnames` in Coq's OWN order for ANY inductive in
+              scope — opam-dep (`Corelib.Init.Datatypes.bool`) and module-nested
+              (`LF.Imp.BreakImp.com`) alike, and crucially for inductives defined in
+              ANOTHER file (which `detyped_inductives`, filtered to `mp_root =
+              this_mp`, can never carry). So the consumer indexes COQ's names to get
+              Coq's name, then resolves THAT by name.
+
+              Shape: one entry per (block, member) — `["<globKey>#<blockIdx>",
+              ["c1","c2",…]]`, where `<globKey>` is already in the consumer's own
+              `".".intercalate (globIds <MutInd>)` form and `<blockIdx>` selects the
+              member of a mutual block. That is verbatim the key
+              `Rocq2Lean.Translate`'s `constructRefCtors` is looked up by, so no
+              conversion is needed on the Lean side. Scope: the `r2l_minds` table —
+              inductives this file's metadata REFERENCES, not the whole env. *)
+           Buffer.add_string buf "],\"inductive_ctor_names\":[";
+           (try
+              let env = Global.env () in
+              let firstic = ref true in
+              Hashtbl.iter (fun key mi ->
+                try
+                  let mib = Environ.lookup_mind mi env in
+                  Array.iteri (fun i oib ->
+                    let names = String.concat ","
+                      (Array.to_list (Array.map (fun id ->
+                         Printf.sprintf "\"%s\"" (esc (Names.Id.to_string id)))
+                         oib.Declarations.mind_consnames)) in
+                    if not !firstic then Buffer.add_char buf ',';
+                    firstic := false;
+                    Buffer.add_string buf
+                      (Printf.sprintf "[\"%s#%d\",[%s]]" (esc key) i names))
+                    mib.Declarations.mind_packets
+                with _ -> ()) r2l_minds
             with _ -> ());
            Buffer.add_string buf "]}";
            let oc = open_out meta_file in
