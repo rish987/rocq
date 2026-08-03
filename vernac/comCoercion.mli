@@ -59,3 +59,7 @@ val class_of_global : GlobRef.t -> cl_typ
 val nonuniform : bool option Attributes.attribute
 
 val change_reverse : GlobRef.t -> reversible:bool -> unit
+
+(* rocq2lean: declared coercions with resolved source/target classes, accumulated at
+   declaration time (see `declare_coercion`); drained by the `.vo` driver. *)
+val r2l_take_declared_coercions : unit -> (GlobRef.t * cl_typ * cl_typ) list

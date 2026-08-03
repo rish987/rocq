@@ -553,7 +553,53 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                     jarr (jstr "GApp" :: jg c :: [jarr (List.map jg args)])
                 | Glob_term.GInt _ | Glob_term.GFloat _ | Glob_term.GString _ ->
                     jarr [jstr "GHole"; jarr [jstr "GInternalHole"]]
-                | _ -> jarr [jstr "GHole"; jarr [jstr "GInternalHole"]]
+                (* rocq2lean: FIXPOINT bodies. A `Fixpoint`'s constant body is a
+                   kernel `Fix`, which detypes to `GRec` — and the catch-all below
+                   used to serialize it as a HOLE, so EVERY recursive definition
+                   arrived at the translator with an empty body and had to keep
+                   rendering from source syntax. Shape (serlib order):
+                   GRec of glob_fix_kind * Id.t array * glob_decl list array
+                           * glob_constr array (types) * glob_constr array (bodies),
+                   glob_decl_g = Name.t * relevance_info * binding_kind
+                                 * glob_constr option * glob_constr. *)
+                | Glob_term.GRec (fk, ids, decls, types, bodies) ->
+                    let jfk = (match fk with
+                      | Glob_term.GFix (ra, i) ->
+                          jarr [jstr "GFix";
+                                jarr [ jarr (Array.to_list (Array.map (function
+                                         | None -> "null"
+                                         | Some k -> string_of_int k) ra));
+                                       string_of_int i ]]
+                      | Glob_term.GCoFix i -> jarr [jstr "GCoFix"; string_of_int i]) in
+                    (* glob_decl_g carries relevance_info 2nd, emitted as null —
+                       same convention as GLambda/GProd above. *)
+                    let jdecl (na, _, bk, bo, ty) =
+                      jarr [jname na; "null"; jbk bk;
+                            (match bo with None -> "null" | Some b -> jg b); jg ty] in
+                    jarr [jstr "GRec"; jfk;
+                          jarr (Array.to_list (Array.map jid ids));
+                          jarr (Array.to_list (Array.map
+                            (fun ds -> jarr (List.map jdecl ds)) decls));
+                          jarr (Array.to_list (Array.map jg types));
+                          jarr (Array.to_list (Array.map jg bodies))]
+                (* rocq2lean: a CAST is a typing annotation, not content — Lean
+                   re-infers, so serialize straight through to the inner term. The
+                   catch-all below used to flatten it to a hole, which is how a
+                   COERCION application (`Coercion Aexp_of_aexp` + `Arguments … /`)
+                   in PLF's assertion notations came out as the unparseable `@_ st`. *)
+                | Glob_term.GCast (c, _, _) -> jnode (DAst.get c)
+                (* rocq2lean: the remaining unhandled nodes stay holes, but each
+                   carries a DISTINGUISHING tag so the next one to matter can be
+                   identified from the sidecar instead of guessed at. The consumer
+                   matches on the "GHole" head only and ignores this payload. *)
+                | Glob_term.GEvar _ -> jarr [jstr "GHole"; jarr [jstr "R2LUnsupported_GEvar"]]
+                | Glob_term.GPatVar _ -> jarr [jstr "GHole"; jarr [jstr "R2LUnsupported_GPatVar"]]
+                | Glob_term.GGenarg _ -> jarr [jstr "GHole"; jarr [jstr "R2LUnsupported_GGenarg"]]
+                | Glob_term.GArray _ -> jarr [jstr "GHole"; jarr [jstr "R2LUnsupported_GArray"]]
+                (* No catch-all: the match is EXHAUSTIVE, so a future glob node added
+                   upstream is a compile error here rather than a silent hole. That
+                   silent hole is exactly what hid `GRec` (every fixpoint body) and
+                   `GCast` (PLF's coercion-headed assertions). *)
               and jpat p =
                 match DAst.get p with
                 | Glob_term.PatVar na ->
@@ -740,6 +786,60 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                       (Printf.sprintf "[\"%s#%d\",[%s]]" (esc key) i names))
                     mib.Declarations.mind_packets
                 with _ -> ()) r2l_minds
+            with _ -> ());
+           (* rocq2lean: DECLARED COERCIONS with their SOURCE and TARGET classes, resolved.
+              The translator otherwise has to read `Coercion tm_var : string >-> tm.` off the
+              SURFACE vernac, where `string`/`tm` are BARE qualids with no qualification and
+              no per-occurrence resolution verdict — so since fully-qualified config keys
+              became mandatory they matched nothing and were emitted verbatim, giving an
+              `instance : Coe string tm` that does not elaborate (which disabled the whole
+              coercion mechanism, including the `Coe aexp Aexp` that Coq's own inserted
+              coercions depend on). `Coercionops` HAS the resolved classes, so publish them
+              rather than making the consumer re-derive them from the function's signature.
+              Each entry: [<function name>, <source class>, <target class>], where a class is
+              a fully-qualified constant/inductive name, or "Sortclass"/"Funclass" for Coq's
+              two non-nominal classes. Filtered to coercions whose FUNCTION belongs to this
+              file, so a file gets only what it declares. *)
+           Buffer.add_string buf "],\"coercion_classes\":[";
+           (try
+              let gref_name = function
+                | Names.GlobRef.ConstRef c -> Some (Names.Constant.to_string c)
+                (* Build from the MODPATH plus the packet's own typename. `MutInd.to_string`
+                   already ends in the block's label, so appending the typename doubled it
+                   (`PLF.Stlc.STLC.tm.tm`); and for a MUTUAL block the i-th packet's name is
+                   not that label at all. Constructors come out type-qualified
+                   (`…tm.tm_var`), matching `inductive_ctor_names`/`ref_resolutions`. *)
+                | Names.GlobRef.IndRef (m, i) ->
+                    let mib = Global.lookup_mind m in
+                    Some (Names.ModPath.to_string (Names.MutInd.modpath m) ^ "."
+                          ^ Names.Id.to_string mib.Declarations.mind_packets.(i).Declarations.mind_typename)
+                | Names.GlobRef.ConstructRef ((m, i), j) ->
+                    let mib = Global.lookup_mind m in
+                    let pkt = mib.Declarations.mind_packets.(i) in
+                    Some (Names.ModPath.to_string (Names.MutInd.modpath m) ^ "."
+                          ^ Names.Id.to_string pkt.Declarations.mind_typename ^ "."
+                          ^ Names.Id.to_string pkt.Declarations.mind_consnames.(j - 1))
+                | Names.GlobRef.VarRef _ -> None in
+              (* A class is a fully-qualified constant/inductive name, or one of Coq's two
+                 non-nominal classes. `Sortclass` is load-bearing for the translator: it must
+                 render as Lean's `Prop` sort keyword, not as an identifier. *)
+              let cl_name = function
+                | Coercionops.CL_SORT -> Some "Sortclass"
+                | Coercionops.CL_FUN -> Some "Funclass"
+                | Coercionops.CL_CONST c -> Some (Names.Constant.to_string c)
+                | Coercionops.CL_IND ind -> gref_name (Names.GlobRef.IndRef ind)
+                | Coercionops.CL_PROJ pr ->
+                    Some (Names.Constant.to_string (Names.Projection.Repr.constant pr))
+                | Coercionops.CL_SECVAR _ -> None in
+              let firstc = ref true in
+              List.iter (fun (gr, src, tgt) ->
+                match gref_name gr, cl_name src, cl_name tgt with
+                | Some f, Some s, Some t ->
+                    if not !firstc then Buffer.add_char buf ',';
+                    firstc := false;
+                    Buffer.add_string buf
+                      (Printf.sprintf "[\"%s\",\"%s\",\"%s\"]" (esc f) (esc s) (esc t))
+                | _ -> ()) (ComCoercion.r2l_take_declared_coercions ())
             with _ -> ());
            Buffer.add_string buf "]}";
            let oc = open_out meta_file in

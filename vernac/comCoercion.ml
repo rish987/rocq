@@ -258,7 +258,19 @@ let inCoercion : coe_info_typ -> obj =
     discharge_function = discharge_coercion;
   }
 
+(* rocq2lean: record every DECLARED coercion with its RESOLVED source/target classes, for
+   the `.r2lmeta.json` `coercion_classes` key. Recorded HERE, at declaration time, because
+   walking `Coercionops.coercions ()` at end-of-file sees only the coercions still in SCOPE —
+   one declared inside a `Module M` is gone once `End M` closes it (PLF's `Coercion tm_var`
+   lives in `Module STLC`, and the end-of-file table held only Corelib's `reverse_coercion`).
+   `declare_coercion` is the single funnel every `try_add_new_coercion*` entry point routes
+   through, so one hook here catches them all. *)
+let r2l_declared_coercions : (GlobRef.t * cl_typ * cl_typ) list ref = ref []
+let r2l_take_declared_coercions () =
+  let l = List.rev !r2l_declared_coercions in r2l_declared_coercions := []; l
+
 let declare_coercion coef ?(local = false) ~reversible ~isid ~src:cls ~target:clt ~params:ps () =
+  r2l_declared_coercions := (coef, cls, clt) :: !r2l_declared_coercions;
   let isproj =
     match coef with
     | GlobRef.ConstRef c -> Structures.PrimitiveProjections.find_opt c
