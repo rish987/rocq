@@ -841,6 +841,65 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                       (Printf.sprintf "[\"%s\",\"%s\",\"%s\"]" (esc f) (esc s) (esc t))
                 | _ -> ()) (ComCoercion.r2l_take_declared_coercions ())
             with _ -> ());
+           (* rocq2lean: the SORT of each constant's TYPE (`Prop`/`Set`/`Type`/`SProp`),
+              for `computeDefIsProof` / `computeThmIsType`. Those are the heaviest
+              remaining LIVE pet consumers -- one `petanque/elaborate` query per definition
+              and per theorem -- and no other key carries a sort, so they could not be
+              migrated to the sidecar.
+
+              This is `Retyping.get_sort_of` on the constant's `const_type`, i.e. the sort
+              of the TYPE, which is exactly the question the consumers ask: a PROOF has
+              type `P : Prop`, whereas a PREDICATE has type `nat -> Prop : Type`. Reading
+              it off the type's own sort therefore distinguishes the two by construction,
+              where peeling to a codomain does not -- conflating them once stubbed every
+              predicate in the library and took SF LF from 18 to 77 errors.
+
+              Same `mp_root` filter and the same `fold_constants` walk as
+              `resolved_types`, so the keys are index-comparable. *)
+           Buffer.add_string buf "],\"constant_sorts\":[";
+           (try
+              let env = Global.env () in
+              let this_mp = Names.ModPath.MPfile ldir in
+              let rec mp_root = function
+                | Names.ModPath.MPdot (mp, _) -> mp_root mp
+                | mp -> mp in
+              let evd = Evd.from_env env in
+              let firsts = ref true in
+              Environ.fold_constants (fun c cb () ->
+                if Names.ModPath.equal (mp_root (Names.Constant.modpath c)) this_mp then begin
+                  try
+                    let ty = EConstr.of_constr cb.Declarations.const_type in
+                    let s = Retyping.get_sort_of env evd ty in
+                    let nm = match EConstr.ESorts.kind evd s with
+                      | Sorts.SProp   -> "SProp"
+                      | Sorts.Prop    -> "Prop"
+                      | Sorts.Set     -> "Set"
+                      | Sorts.Type _  -> "Type"
+                      | Sorts.QSort _ -> "QSort" in
+                    if not !firsts then Buffer.add_char buf ',';
+                    firsts := false;
+                    Buffer.add_string buf
+                      (Printf.sprintf "[\"%s\",\"%s\"]" (esc (Names.Constant.to_string c)) nm)
+                  with _ -> ()
+                end) env ()
+            with _ -> ());
+           (* rocq2lean: constants/inductives in DECLARATION ORDER (see
+              `Global.r2l_structure_order`). Every other key walks
+              `Environ.fold_constants`, which yields the environment's map order, not
+              source order -- so the consumer had no way to place a declaration that has
+              no source AST (an `Include`d inductive, an auto-generated scheme) BEFORE
+              its users. The walk is rooted at this unit's own modpath, so unlike
+              `resolved_types` it needs no prefix filter to keep a `Require`d unit out. *)
+           Buffer.add_string buf "],\"declaration_order\":[";
+           (try
+              let firstd = ref true in
+              List.iter (fun (kind, name) ->
+                if not !firstd then Buffer.add_char buf ',';
+                firstd := false;
+                Buffer.add_string buf
+                  (Printf.sprintf "[\"%s\",\"%s\"]" (esc kind) (esc name)))
+                (Global.r2l_structure_order ())
+            with _ -> ());
            Buffer.add_string buf "]}";
            let oc = open_out meta_file in
            output_string oc (Buffer.contents buf); close_out oc

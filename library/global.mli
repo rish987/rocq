@@ -52,6 +52,12 @@ val export_private_constants :
   Safe_typing.private_constants ->
   Safe_typing.exported_private_constant list
 
+(* rocq2lean: the current library's constants/inductives in DECLARATION order
+   (`("const"|"ind", kername)`), read off the safe environment's structure body and
+   consumed by ccompile.ml for the `declaration_order` sidecar key. Rooted at the current
+   modpath, so it only ever reports this compilation unit's own declarations. *)
+val r2l_structure_order : unit -> (string * string) list
+
 val add_constant :
   ?typing_flags:typing_flags ->
   Id.t -> Entries.constant_entry -> Constant.t

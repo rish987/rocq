@@ -108,6 +108,50 @@ let add_modtype id me inl = globalize (Safe_typing.add_modtype (i2l id) me inl)
 let add_module id me inl = globalize (Safe_typing.add_module (i2l id) me inl)
 let add_include me ismod inl = globalize (Safe_typing.add_include me ismod inl)
 
+(* rocq2lean: the constants and inductives of the library being compiled, in DECLARATION
+   ORDER, for the `.r2lmeta.json` `declaration_order` key.
+
+   Every other key walks `Environ.fold_constants`, which yields the constant MAP's own
+   traversal order, not source order -- Ring_theory's constants come out
+   `Rmul_comm, SRmul_0_l, …` where the source declares `pow_pos, pow_pos_swap, …`. Lean
+   needs a declaration to PRECEDE its users, so the consumer needs the real order, and it
+   cannot be recovered from source positions either: Coq's auto-generated elimination
+   schemes and `Include`d copies have no source AST at all (`Pos.mask` arrives via
+   `Include BinPosDef.Pos`, and 1408 of BinInt's 1678 constants come in that way).
+
+   Coq already keeps exactly this, fully elaborated and correctly sequenced: the safe
+   environment's structure body, the ordered `(Label.t * structure_field_body) list` that
+   gets serialized into the `.vo`. `Include` splices its fields in at the Include's own
+   position and a scheme lands where it was generated, so walking that list depth-first --
+   recursing into submodules, which also supplies the module prefix that makes a field
+   label into a kername (`…BinInt.Z.add`) -- yields Coq's own order by construction. No
+   event hooks, no environment diffing, no re-sorting downstream.
+
+   Safe to read after `Library.save_library_to`: `Safe_typing.export` only reads
+   `revstruct`, it does not clear it. *)
+let r2l_structure_order () =
+  let acc = ref [] in
+  let rec walk mp sb =
+    List.iter (fun (l, field) ->
+      let name = Names.ModPath.to_string mp ^ "." ^ Names.Label.to_string l in
+      match field with
+      | Declarations.SFBconst _ -> acc := ("const", name) :: !acc
+      | Declarations.SFBmind _ -> acc := ("ind", name) :: !acc
+      | Declarations.SFBmodule mb ->
+        (match Mod_declarations.mod_type mb with
+         | Declarations.NoFunctor sb' -> walk (Names.ModPath.MPdot (mp, l)) sb'
+         (* A functor has no instantiated contents to name; its applications appear as
+            their own `SFBmodule` fields where they are instantiated. *)
+         | Declarations.MoreFunctor _ -> ())
+      | Declarations.SFBmodtype _ | Declarations.SFBrules _ -> ()) sb in
+  (try
+     let senv = safe_env () in
+     (* `structure_body_of_safe_env` is `revstruct`: most recent declaration first. *)
+     walk (Safe_typing.current_modpath senv)
+       (List.rev (Safe_typing.structure_body_of_safe_env senv))
+   with _ -> ());
+  List.rev !acc
+
 let open_section () = globalize0 Safe_typing.open_section
 let close_section fs = globalize0_with_summary fs Safe_typing.close_section
 let sections_are_opened () = Safe_typing.sections_are_opened (safe_env())
