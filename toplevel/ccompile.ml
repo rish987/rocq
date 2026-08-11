@@ -525,8 +525,22 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                     let tyj = match ty with None -> "null" | Some t -> jg t in
                     jarr [jstr "GLetIn"; jname na; "null"; jg d; tyj; jg b]
                 | Glob_term.GCases (_, rtn, tomatch, clauses) ->
-                    let jtom (scrut, (na, _)) =
-                      jarr [jg scrut; jarr [jname na; "null"]] in
+                    (* rocq2lean: the `in I _ … c0` clause (`aliastyp`), alongside the
+                       alias. It BINDS the index variables the return predicate mentions,
+                       and dropping it left them FREE in the serialized motive — the
+                       consumer then had to guess which free `GVar`s were index binders and
+                       match them to positions by first occurrence, which is right for an
+                       eliminator's `P i₁ … iₘ` but mis-assigns silently for a motive that
+                       mentions its indices out of order. Serialized as
+                       `[inductive, [names…]]`, so the consumer reads the binders and their
+                       ORDER directly. *)
+                    let jaliastyp = function
+                      | None -> "null"
+                      | Some at ->
+                        let (ind, nas) = at.CAst.v in
+                        jarr [jind ind; jarr (List.map jname nas)] in
+                    let jtom (scrut, (na, aty)) =
+                      jarr [jg scrut; jarr [jname na; jaliastyp aty]] in
                     let jclause cl =
                       let (ids, pats, body) = cl.CAst.v in
                       "{\"v\":" ^ jarr [ jarr (List.map jid ids);
