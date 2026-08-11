@@ -524,7 +524,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 | Glob_term.GLetIn (na, _, d, ty, b) ->
                     let tyj = match ty with None -> "null" | Some t -> jg t in
                     jarr [jstr "GLetIn"; jname na; "null"; jg d; tyj; jg b]
-                | Glob_term.GCases (_, _, tomatch, clauses) ->
+                | Glob_term.GCases (_, rtn, tomatch, clauses) ->
                     let jtom (scrut, (na, _)) =
                       jarr [jg scrut; jarr [jname na; "null"]] in
                     let jclause cl =
@@ -532,7 +532,18 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                       "{\"v\":" ^ jarr [ jarr (List.map jid ids);
                                          jarr (List.map jpat pats); jg body ]
                         ^ ",\"loc\":null}" in
-                    jarr [jstr "GCases"; jarr [jstr "RegularStyle"]; "null";
+                    (* rocq2lean: the RETURN PREDICATE (the dependent-match motive).
+                       Coq's `match H in I _ _ _ c0 return T c0 with` types each branch
+                       against the motive AT THAT BRANCH'S INDEX, which is how the absurd
+                       branches of an inversion get discharged. Lean cannot re-synthesise
+                       it, and beta-applying it to one index (what the consumer did while
+                       this slot was `null`) pins ONE type for the whole match, so the
+                       branches — which genuinely have different types — cannot all check.
+                       `raw_print` above already makes detyping reconstruct the motive
+                       instead of dropping it as synthesisable, so it is here to serialize;
+                       we were discarding it. Consumer emits Lean's `(motive := …)`. *)
+                    jarr [jstr "GCases"; jarr [jstr "RegularStyle"];
+                          (match rtn with None -> "null" | Some p -> jg p);
                           jarr (List.map jtom tomatch); jarr (List.map jclause clauses)]
                 | Glob_term.GIf (c, (na, _), t, e) ->
                     jarr [jstr "GIf"; jg c; jarr [jname na; "null"]; jg t; jg e]
