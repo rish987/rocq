@@ -572,7 +572,28 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                       | Glob_term.UNamed [(Glob_term.GSProp, _)] -> "SProp"
                       | Glob_term.UNamed [(Glob_term.GSet, _)]   -> "Set"
                       | _                                        -> "Type") in
-                    jarr [jstr "GSort"; jstr sname]
+                    (* rocq2lean: the UNIVERSE, as a THIRD element (additive -- consumers
+                       reading arr[1] as the family string are unaffected).
+                       `Type@{i}` and `Type@{i+1}` are BOTH the bare family "Type", so
+                       without this they are indistinguishable: Coq's `Let U := Type` is
+                       `U : Type@{i+1} := Type@{i}`, and both slots serialized identically.
+                       Note `Detyping.detype_sort` only KEEPS the level when
+                       `Detyping.print_universes` is set -- otherwise it returns the
+                       anonymous `glob_Type_sort` and there is nothing here to serialize.
+                       Shape: null (anonymous/flexible) | [[name, increment], ...] (a max). *)
+                    let jsortname = function
+                      | Glob_term.GSProp        -> jstr "SProp"
+                      | Glob_term.GProp         -> jstr "Prop"
+                      | Glob_term.GSet          -> jstr "Set"
+                      | Glob_term.GUniv l       -> jstr (Univ.Level.to_string l)
+                      | Glob_term.GRawUniv l    -> jstr (Univ.Level.to_string l)
+                      | Glob_term.GLocalUniv id -> jstr (Names.Id.to_string id.CAst.v) in
+                    let juniv = (match u with
+                      | Glob_term.UAnonymous _ -> "null"
+                      | Glob_term.UNamed l ->
+                        jarr (List.map
+                                (fun (n, i) -> jarr [jsortname n; string_of_int i]) l)) in
+                    jarr [jstr "GSort"; jstr sname; juniv]
                 | Glob_term.GHole _ -> jarr [jstr "GHole"; jarr [jstr "GInternalHole"]]
                 | Glob_term.GProj (_, args, c) ->
                     jarr (jstr "GApp" :: jg c :: [jarr (List.map jg args)])
@@ -653,7 +674,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                           shape the translator's `translateGlob` was built for.
                           Non-`match` node shapes are unaffected. *)
                        let gc =
-                         Flags.with_option Flags.raw_print
+                         Flags.with_options [Flags.raw_print; Detyping.print_universes]
                            (Detyping.detype Detyping.Now env evd)
                            (EConstr.of_constr body) in
                        let j = jg gc in
@@ -677,7 +698,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 if Names.ModPath.equal (mp_root (Names.Constant.modpath c)) this_mp then
                   (try
                      let gc =
-                       Flags.with_option Flags.raw_print
+                       Flags.with_options [Flags.raw_print; Detyping.print_universes]
                          (Detyping.detype Detyping.Now env evd)
                          (EConstr.of_constr cb.Declarations.const_type) in
                      let j = jg gc in
@@ -713,7 +734,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                        let ind_name =
                          Names.ModPath.to_string (Names.MutInd.modpath mind) ^ "."
                          ^ Names.Id.to_string oib.Declarations.mind_typename in
-                       let dj t = jg (Flags.with_option Flags.raw_print
+                       let dj t = jg (Flags.with_options [Flags.raw_print; Detyping.print_universes]
                                         (Detyping.detype Detyping.Now env evd)
                                         (EConstr.of_constr t)) in
                        let arity_g = dj ind_ty in
