@@ -552,14 +552,20 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                                 | Constr.Prod (na, d, cod)
                                   when List.exists (fun l -> eq_constr evd l d) !lifted ->
                                   incr r2l_downs;
-                                  let d1 = Vars.lift 1 d in
+                                  let d1 = Vars.lift 1 (go env d) in
                                   let arg = mk_down d1 (mkRel 1) in
-                                  mkLambda (na, mk_lift d,
+                                  mkLambda (na, mk_lift (go env d),
                                             coerce cod (mkApp (Vars.lift 1 t, [| arg |])))
                                 | _ ->
                                   if List.exists (fun l -> eq_constr evd l ty) !lifted
-                                  then begin incr r2l_ups; mk_up ty t end
-                                  else t in
+                                  then begin incr r2l_ups; mk_up (go env ty) t end
+                                  else
+                                    (* The TYPE argument of a marker is EMITTED, so it
+                                       must be in output form -- explicitated like any
+                                       other subterm. Passing the original produced
+                                       `PLift.up (ex A …) p` where `p` already had the
+                                       LIFTED type `ex (PLift A) …`. *)
+                                    t in
                               out.(i) <- coerce dom' out.(i));
                            (* Substitute the ORIGINAL argument: the markers must never
                               reach Retyping/whd_all. *)
