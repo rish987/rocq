@@ -675,6 +675,55 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
               assigns them (`sort_universes` in vernac/vernacentries.ml, replicated
               here because it is not exported). The consumer maps Coq level n to
               Lean `Type n` -- Coq's `Set` is Lean's `Type 0`. *)
+           (* rocq2lean: a POLYMORPHIC declaration's OWN universe constraints.
+
+              A polymorphic declaration quantifies over `Var 0 … Var (n-1)` and carries
+              the constraints between them (`AbstractContext`); they are INFERRED by the
+              kernel, not written. Unlike the monomorphic levels — which are global,
+              minimized, and rendered at a concrete level — these are real binders, and
+              Lean has no way to state a constraint on a universe PARAMETER.
+
+              The encoding that needs no such mechanism: for `Var i <= Var j`, render
+              `u_j` as `max u_j u_i` everywhere. The constraint then holds
+              definitionally, and the declaration stays exactly as general as Coq's,
+              since any Coq-admissible instantiation already satisfies it (so the max
+              equals `u_j` there).
+
+              Entry: ["<const>", [[i, "<=" | "<", j], …]] over de Bruijn INDICES, which
+              is what `Var i` in the serialized sorts already refers to. *)
+           Buffer.add_string buf "],\"poly_constraints\":[";
+           let firstpc = ref true in
+           let jpolycstrs name auctx =
+             let cstrs = UVars.AbstractContext.repr auctx |> UVars.UContext.constraints in
+             if not (Univ.Constraints.is_empty cstrs) then begin
+               let idx_of l =
+                 match Univ.Level.var_index l with Some i -> Some i | None -> None in
+               let items = Univ.Constraints.fold (fun (l, d, r) acc ->
+                   match idx_of l, idx_of r with
+                   | Some i, Some j ->
+                     let ds = (match d with
+                         | Univ.Lt -> "<" | Univ.Le -> "<=" | Univ.Eq -> "=") in
+                     (Printf.sprintf "[%d,\"%s\",%d]" i ds j) :: acc
+                   | _ -> acc) cstrs [] in
+               if items <> [] then begin
+                 if not !firstpc then Buffer.add_char buf ',';
+                 firstpc := false;
+                 Buffer.add_string buf
+                   (Printf.sprintf "[\"%s\",[%s]]" (esc name) (String.concat "," items))
+               end
+             end in
+           let rec pc_mp_root = function
+             | Names.ModPath.MPdot (mp, _) -> pc_mp_root mp
+             | mp -> mp in
+           let pc_this_mp = Names.ModPath.MPfile ldir in
+           (try
+              Environ.fold_constants (fun c cb () ->
+                  if Names.ModPath.equal (pc_mp_root (Names.Constant.modpath c)) pc_this_mp then
+                    match cb.Declarations.const_universes with
+                    | Declarations.Polymorphic auctx ->
+                      jpolycstrs (Names.Constant.to_string c) auctx
+                    | _ -> ()) (Global.env ()) ()
+            with _ -> ());
            Buffer.add_string buf "],\"universe_valuation\":[";
            let firstuv = ref true in
            (try
