@@ -495,192 +495,38 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
               let r2l_apps = ref 0 in
               let r2l_explicitate env evd c0 =
                 let open EConstr in
-                let mk_lift a = mkApp (UnsafeMonomorphic.mkConst r2l_lift_c, [| a |]) in
-                let mk_up t a = mkApp (UnsafeMonomorphic.mkConst r2l_up_c, [| t; a |]) in
-                let mk_down t a = mkApp (UnsafeMonomorphic.mkConst r2l_down_c, [| t; a |]) in
-                let is_propish s = Sorts.is_prop s || Sorts.is_sprop s in
+                let _mk_lift a = mkApp (UnsafeMonomorphic.mkConst r2l_lift_c, [| a |]) in
+                let _mk_up t a = mkApp (UnsafeMonomorphic.mkConst r2l_up_c, [| t; a |]) in
+                let _mk_down t a = mkApp (UnsafeMonomorphic.mkConst r2l_down_c, [| t; a |]) in
+                let _is_propish s = Sorts.is_prop s || Sorts.is_sprop s in
                 let rec go env c =
                   match kind evd c with
-                  | Constr.App (f, args) ->
-                    incr r2l_apps;
-                    let f' = go env f in
-                    let out = Array.map (go env) args in
-                    (try
-                       let fty = ref (Retyping.get_type_of env evd f) in
-                       (* The SAME telescope, but substituted with the REWRITTEN
-                          arguments, so it says what the type will be in LEAN. Coq's
-                          telescope cannot: it is built from the originals and knows
-                          nothing of our rewrites, and `whd_all` beta-reduces
-                          `(fun a => P a) x` to `P x` before we could recognise the
-                          motive we lifted. Never retyped -- it carries markers -- only
-                          inspected syntactically after beta. *)
-                       let fty_out = ref (Retyping.get_type_of env evd f) in
-                       (* Original arg values whose SORT we lifted; a later argument
-                          whose expected type is one of them is an ELEMENT of a lifted
-                          type and needs `up`. Tracking values (not de Bruijn indices)
-                          keeps this independent of the telescope's shape. *)
-                       let lifted = ref [] in
-                       (* Arguments whose VALUE we rewrote with a codomain lift
-                          (`P` became `fun x => lift (P x)`). A LATER argument whose
-                          expected type is an application of one of these now needs an
-                          `up`: `eq_rect`'s motive is codomain-lifted, so its proof
-                          argument must be `PLift (P ...)` where Coq had `P ...`. The
-                          expected type is computed from Coq's ORIGINAL telescope, so
-                          nothing in it records that we changed the motive -- this list
-                          is what carries that across arguments. *)
-                       let codlifted = ref [] in
-                       Array.iteri (fun i a ->
-                         match kind evd (Reductionops.whd_all env evd !fty) with
-                         | Constr.Prod (_, dom, cod) ->
-                           let dom' = Reductionops.whd_all env evd dom in
-                           (match kind evd dom' with
-                            | Constr.Sort sdom ->
-                              (* TYPE-argument position. *)
-                              let aty =
-                                Reductionops.whd_all env evd
-                                  (Retyping.get_type_of env evd a) in
-                              (match kind evd aty with
-                               | Constr.Sort sa
-                                 when is_propish (ESorts.kind evd sa)
-                                   && not (is_propish (ESorts.kind evd sdom)) ->
-                                 out.(i) <- mk_lift out.(i);
-                                 lifted := a :: !lifted;
-                                 incr r2l_lifts
-                               | _ -> ())
-                            | _ ->
-                              (* Assaf's coercion, transporting the argument from the
-                                 type Coq gave it to the type the LIFTED signature now
-                                 demands. `lifted` holds the type arguments we already
-                                 lifted in THIS telescope, and the expected type here is
-                                 still in original (unlifted) terms, so a lifted value
-                                 occurring in it marks where transport is needed.
+                  (* EXPLICIT CUMULATIVITY: RETIRED (2026-08-12).
 
-                                   ty = A          (A lifted)  ->  up A a
-                                   ty = ∀(x:A), B  (A lifted)  ->  fun (x : ↑A) => <coerce (a (down A x)) B>
+                     This branch inserted R2L.lift / R2L.up / R2L.down at every use of
+                     Coq's Prop <= Type, per Assaf. It worked -- cumulativity sites went
+                     553 -> 0 -- but it was the wrong construction for Lean, and the
+                     translator now renders the markers as identities anyway.
 
-                                 The second is the Π case of full reflection: `↑` does
-                                 not commute with `→` in Lean (`PLift (A → B)` and
-                                 `PLift A → PLift B` are different types), so the
-                                 function must be eta-expanded and its argument brought
-                                 back down. Without it we lifted `ex`'s type argument but
-                                 left `P : A → Prop` behind, which is exactly the
-                                 remaining mismatch. *)
-                              (* The ACTUAL type Coq gave this argument; `coerce`
-                                 compares it against the expected one so it can tell a
-                                 CODOMAIN sort mismatch (`P : A → Prop` where `A → Type`
-                                 is wanted) from a plain match. *)
-                              let act =
-                                try Reductionops.whd_all env evd
-                                      (Retyping.get_type_of env evd a)
-                                with _ -> dom' in
-                              (* Codomain of the actual type, when it is a product. *)
-                              let act_cod a0 =
-                                match kind evd a0 with
-                                | Constr.Prod (_, _, c) ->
-                                  (try Some (Reductionops.whd_all env evd c) with _ -> Some c)
-                                | _ -> None in
-                              let cod_is_prop a0 =
-                                match act_cod a0 with
-                                | Some c ->
-                                  (match kind evd c with
-                                   | Constr.Sort sa -> is_propish (ESorts.kind evd sa)
-                                   | _ -> false)
-                                | None -> false in
-                              (* What LEAN will demand here. If it is `lift T` and the
-                                 argument is not already lifted, it needs an `up` --
-                                 this is the general form of the case where an earlier
-                                 argument (a motive) was codomain-lifted, which Coq's
-                                 own telescope cannot express. *)
-                              let dom_out =
-                                match kind evd (Reductionops.whd_beta env evd !fty_out) with
-                                | Constr.Prod (_, d, _) ->
-                                  Some (Reductionops.whd_beta env evd d)
-                                | _ -> None in
-                              let head_is_marker c0 x =
-                                match kind evd x with
-                                | Constr.App (h, _) ->
-                                  (match kind evd h with
-                                   | Constr.Const (c, _) -> Names.Constant.CanOrd.equal c c0
-                                   | _ -> false)
-                                | _ -> false in
-                              let is_lift_app x =
-                                match kind evd x with
-                                | Constr.App (_, [| t0 |]) when head_is_marker r2l_lift_c x ->
-                                  Some t0
-                                | _ -> None in
-                              let rec coerce ty act t =
-                                match kind evd ty with
-                                | Constr.Prod (na, d, cod)
-                                  when List.exists (fun l -> eq_constr evd l d) !lifted ->
-                                  incr r2l_downs;
-                                  let d_o = go env d in
-                                  let arg = mk_down (Vars.lift 1 d_o) (mkRel 1) in
-                                  let body = mkApp (Vars.lift 1 t, [| arg |]) in
-                                  (* A `Sort` codomain carries no de Bruijn indices, so it
-                                     needs no substitution -- and it is exactly the case
-                                     that matters: the function RETURNS a type, and Coq's
-                                     returns a Prop where a Type is demanded. *)
-                                  let body =
-                                    match kind evd cod with
-                                    | Constr.Sort se
-                                      when not (is_propish (ESorts.kind evd se))
-                                        && cod_is_prop act ->
-                                      incr r2l_lifts; codlifted := a :: !codlifted;
-                                      mk_lift body
-                                    | _ -> body in
-                                  mkLambda (na, mk_lift d_o,
-                                            (match kind evd cod with
-                                             | Constr.Sort _ -> body
-                                             | _ -> coerce cod (Option.default cod (act_cod act)) body))
-                                | Constr.Prod (na, d, cod)
-                                  when (match kind evd cod with
-                                        | Constr.Sort se -> not (is_propish (ESorts.kind evd se))
-                                        | _ -> false)
-                                    && cod_is_prop act ->
-                                  (* Domain unchanged, codomain sort differs: eta-expand and
-                                     lift the RESULT (`sigT nat P` with `P : nat → Prop`). *)
-                                  incr r2l_lifts; codlifted := a :: !codlifted;
-                                  mkLambda (na, go env d,
-                                            mk_lift (mkApp (Vars.lift 1 t, [| mkRel 1 |])))
-                                | _ ->
-                                  if List.exists (fun l -> eq_constr evd l ty) !lifted
-                                  then begin incr r2l_ups; mk_up (go env ty) t end
-                                  else if (match kind evd ty with
-                                           | Constr.App (h, _) ->
-                                             List.exists (fun l -> eq_constr evd l h) !codlifted
-                                           | _ -> false)
-                                  then begin incr r2l_ups; mk_up (go env ty) t end
-                                  else
-                                    (* The TYPE argument of a marker is EMITTED, so it
-                                       must be in output form -- explicitated like any
-                                       other subterm. Passing the original produced
-                                       `PLift.up (ex A …) p` where `p` already had the
-                                       LIFTED type `ex (PLift A) …`. *)
-                                    t in
-                              (* MEASURED AND REVERTED: driving the `up` off `dom_out`
-                                 (the telescope substituted with the OUTPUT arguments,
-                                 which says what LEAN will demand) halves this cluster,
-                                 116 -> 66, and moves the rest: the "Application type
-                                 mismatch" total is UNCHANGED at 215, only the argument
-                                 named shifts, and corelib goes 463 -> 466. The inserted
-                                 `up` satisfies one position and breaks the next, so the
-                                 mismatch is deeper than a missing wrapper -- probably
-                                 that the lifted motive changes the RESULT type too, and
-                                 the whole application needs coercing rather than one
-                                 argument. `dom_out` is left computed and unused; it is
-                                 the right instrument for that, once the rule is known. *)
-                              ignore dom_out; ignore is_lift_app;
-                              out.(i) <- coerce dom' act out.(i));
-                           (* Substitute the ORIGINAL argument: the markers must never
-                              reach Retyping/whd_all. *)
-                           (match kind evd (Reductionops.whd_beta env evd !fty_out) with
-                            | Constr.Prod (_, _, cod_out) ->
-                              fty_out := Vars.subst1 out.(i) cod_out
-                            | _ -> fty_out := !fty);
-                           fty := Vars.subst1 a cod
-                         | _ -> ()) args
-                     with _ -> incr r2l_fails);
-                    mkApp (f', out)
+                     Assaf's lift acts on universe CODES, in a Tarski presentation whose
+                     full-reflection equations give T(lift a) = T(a): decoding a lifted
+                     code yields the SAME type, so TERMS are never coerced. Lean has no
+                     such definitional equation -- PLift A is an inductive genuinely
+                     distinct from A -- so every lift forced up/down on elements, and
+                     because types mention earlier arguments those wrappers propagated
+                     through the whole telescope. Patching one argument satisfied it and
+                     broke the next (measured: cluster 116 -> 66, mismatch total pinned
+                     at 215).
+
+                     The replacement adjusts the DECLARATION instead: a Coq `Type` in
+                     binder position renders as `Sort _`, which admits exactly what Coq's
+                     cumulativity admits there, so Coq's term goes through verbatim.
+                     corelib 463 -> 388, cluster 116 -> 4, PLift in output 95 -> 0.
+
+                     Kept below: the Case scrutinee ascription, unrelated, and still the
+                     source of index terms. *)
+                  | Constr.App _ ->
+                    Termops.map_constr_with_full_binders env evd push_rel go env c
                   | Constr.Case _ ->
                     (* SCRUTINEE TYPE for an INDEXED match. Lean needs the index TERMS
                        as discriminants so each branch can refine them, and the glob
