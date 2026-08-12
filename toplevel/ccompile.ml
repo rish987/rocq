@@ -948,7 +948,21 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 if Names.ModPath.equal (mp_root (Names.MutInd.modpath mind)) this_mp then
                   Array.iteri (fun i oib ->
                     (try
-                       let univ = UVars.Instance.empty in
+                       (* A POLYMORPHIC inductive needs an instance of its OWN universe
+                          context; `Instance.empty` only fits a monomorphic one, and
+                          `type_of_inductive` raises otherwise -- which the enclosing
+                          `try` swallowed, silently dropping EVERY polymorphic inductive
+                          from the sidecar. `Set Universe Polymorphism` in
+                          CRelationClasses meant `PreOrder`/`PER`/`Equivalence`/
+                          `StrictOrder`/`RewriteRelation` never reached the translator at
+                          all, so each fell back to a parameterless `axiom X : Type` and
+                          every use became "Function expected at PreOrder" -- ~45 errors
+                          from five missing entries. *)
+                       let univ =
+                         match mib.Declarations.mind_universes with
+                         | Declarations.Polymorphic auctx ->
+                           UVars.make_abstract_instance auctx
+                         | _ -> UVars.Instance.empty in
                        let ind_ty = Inductive.type_of_inductive ((mib, oib), univ) in
                        let ctor_tys = Inductive.type_of_constructors ((mind, i), univ) (mib, oib) in
                        let ind_name =
