@@ -507,11 +507,28 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                     let out = Array.map (go env) args in
                     (try
                        let fty = ref (Retyping.get_type_of env evd f) in
+                       (* The SAME telescope, but substituted with the REWRITTEN
+                          arguments, so it says what the type will be in LEAN. Coq's
+                          telescope cannot: it is built from the originals and knows
+                          nothing of our rewrites, and `whd_all` beta-reduces
+                          `(fun a => P a) x` to `P x` before we could recognise the
+                          motive we lifted. Never retyped -- it carries markers -- only
+                          inspected syntactically after beta. *)
+                       let fty_out = ref (Retyping.get_type_of env evd f) in
                        (* Original arg values whose SORT we lifted; a later argument
                           whose expected type is one of them is an ELEMENT of a lifted
                           type and needs `up`. Tracking values (not de Bruijn indices)
                           keeps this independent of the telescope's shape. *)
                        let lifted = ref [] in
+                       (* Arguments whose VALUE we rewrote with a codomain lift
+                          (`P` became `fun x => lift (P x)`). A LATER argument whose
+                          expected type is an application of one of these now needs an
+                          `up`: `eq_rect`'s motive is codomain-lifted, so its proof
+                          argument must be `PLift (P ...)` where Coq had `P ...`. The
+                          expected type is computed from Coq's ORIGINAL telescope, so
+                          nothing in it records that we changed the motive -- this list
+                          is what carries that across arguments. *)
+                       let codlifted = ref [] in
                        Array.iteri (fun i a ->
                          match kind evd (Reductionops.whd_all env evd !fty) with
                          | Constr.Prod (_, dom, cod) ->
@@ -569,6 +586,28 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                                    | Constr.Sort sa -> is_propish (ESorts.kind evd sa)
                                    | _ -> false)
                                 | None -> false in
+                              (* What LEAN will demand here. If it is `lift T` and the
+                                 argument is not already lifted, it needs an `up` --
+                                 this is the general form of the case where an earlier
+                                 argument (a motive) was codomain-lifted, which Coq's
+                                 own telescope cannot express. *)
+                              let dom_out =
+                                match kind evd (Reductionops.whd_beta env evd !fty_out) with
+                                | Constr.Prod (_, d, _) ->
+                                  Some (Reductionops.whd_beta env evd d)
+                                | _ -> None in
+                              let head_is_marker c0 x =
+                                match kind evd x with
+                                | Constr.App (h, _) ->
+                                  (match kind evd h with
+                                   | Constr.Const (c, _) -> Names.Constant.CanOrd.equal c c0
+                                   | _ -> false)
+                                | _ -> false in
+                              let is_lift_app x =
+                                match kind evd x with
+                                | Constr.App (_, [| t0 |]) when head_is_marker r2l_lift_c x ->
+                                  Some t0
+                                | _ -> None in
                               let rec coerce ty act t =
                                 match kind evd ty with
                                 | Constr.Prod (na, d, cod)
@@ -586,7 +625,8 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                                     | Constr.Sort se
                                       when not (is_propish (ESorts.kind evd se))
                                         && cod_is_prop act ->
-                                      incr r2l_lifts; mk_lift body
+                                      incr r2l_lifts; codlifted := a :: !codlifted;
+                                      mk_lift body
                                     | _ -> body in
                                   mkLambda (na, mk_lift d_o,
                                             (match kind evd cod with
@@ -599,11 +639,16 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                                     && cod_is_prop act ->
                                   (* Domain unchanged, codomain sort differs: eta-expand and
                                      lift the RESULT (`sigT nat P` with `P : nat → Prop`). *)
-                                  incr r2l_lifts;
+                                  incr r2l_lifts; codlifted := a :: !codlifted;
                                   mkLambda (na, go env d,
                                             mk_lift (mkApp (Vars.lift 1 t, [| mkRel 1 |])))
                                 | _ ->
                                   if List.exists (fun l -> eq_constr evd l ty) !lifted
+                                  then begin incr r2l_ups; mk_up (go env ty) t end
+                                  else if (match kind evd ty with
+                                           | Constr.App (h, _) ->
+                                             List.exists (fun l -> eq_constr evd l h) !codlifted
+                                           | _ -> false)
                                   then begin incr r2l_ups; mk_up (go env ty) t end
                                   else
                                     (* The TYPE argument of a marker is EMITTED, so it
@@ -612,9 +657,26 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                                        `PLift.up (ex A …) p` where `p` already had the
                                        LIFTED type `ex (PLift A) …`. *)
                                     t in
+                              (* MEASURED AND REVERTED: driving the `up` off `dom_out`
+                                 (the telescope substituted with the OUTPUT arguments,
+                                 which says what LEAN will demand) halves this cluster,
+                                 116 -> 66, and moves the rest: the "Application type
+                                 mismatch" total is UNCHANGED at 215, only the argument
+                                 named shifts, and corelib goes 463 -> 466. The inserted
+                                 `up` satisfies one position and breaks the next, so the
+                                 mismatch is deeper than a missing wrapper -- probably
+                                 that the lifted motive changes the RESULT type too, and
+                                 the whole application needs coercing rather than one
+                                 argument. `dom_out` is left computed and unused; it is
+                                 the right instrument for that, once the rule is known. *)
+                              ignore dom_out; ignore is_lift_app;
                               out.(i) <- coerce dom' act out.(i));
                            (* Substitute the ORIGINAL argument: the markers must never
                               reach Retyping/whd_all. *)
+                           (match kind evd (Reductionops.whd_beta env evd !fty_out) with
+                            | Constr.Prod (_, _, cod_out) ->
+                              fty_out := Vars.subst1 out.(i) cod_out
+                            | _ -> fty_out := !fty);
                            fty := Vars.subst1 a cod
                          | _ -> ()) args
                      with _ -> incr r2l_fails);
