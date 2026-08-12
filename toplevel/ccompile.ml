@@ -659,6 +659,56 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                     Termops.map_constr_with_full_binders env evd push_rel go env c
                 in
                 try go env c0 with _ -> incr r2l_fails; c0 in
+           (* rocq2lean: UNIVERSE VALUATION for Coq's MONOMORPHIC levels.
+
+              Coq's default is monomorphic: each `Type` mints a fresh GLOBAL level,
+              shared across the library, and the constraints live in one global graph
+              that Coq MINIMIZES. Those levels are NOT per-declaration parameters --
+              measured over a 12-module corelib closure, 863 level names denote three
+              actual levels (`Set < Type.0 < Type.1`, 855 names collapsed onto
+              `Type.0`). Rendering them as Lean universe parameters manufactures
+              distinctions Coq does not make; rendering them all as a bare sort
+              collapses the one edge that IS strict.
+
+              So emit each level's VALUE: the length of the longest chain of `Lt`
+              constraints from `Set`, which is exactly how `Print Sorted Universes`
+              assigns them (`sort_universes` in vernac/vernacentries.ml, replicated
+              here because it is not exported). The consumer maps Coq level n to
+              Lean `Type n` -- Coq's `Set` is Lean's `Type 0`. *)
+           Buffer.add_string buf "],\"universe_valuation\":[";
+           let firstuv = ref true in
+           (try
+              let g = UGraph.repr (Global.universes ()) in
+              let open Univ in
+              let rec normalize u = match Level.Map.find u g with
+                | UGraph.Alias u -> normalize u
+                | UGraph.Node _ -> u in
+              let get_next u = match Level.Map.find u g with
+                | UGraph.Alias _ -> Level.Map.empty
+                | UGraph.Node ltle -> ltle in
+              let rec traverse accu todo = match todo with
+                | [] -> accu
+                | (u, n) :: todo ->
+                  let n = match Level.Map.find u accu with
+                    | m -> if m < n then Some n else None
+                    | exception Not_found -> Some n in
+                  (match n with
+                   | None -> traverse accu todo
+                   | Some n ->
+                     let accu = Level.Map.add u n accu in
+                     let fold v lt todo =
+                       let v = normalize v in
+                       if lt then (v, n + 1) :: todo else (v, n) :: todo in
+                     let todo = Level.Map.fold fold (get_next u) todo in
+                     traverse accu todo) in
+              let levels = traverse Level.Map.empty [normalize Level.set, 0] in
+              Level.Map.iter (fun u _ ->
+                  let v = try Level.Map.find (normalize u) levels with Not_found -> 0 in
+                  if not !firstuv then Buffer.add_char buf ',';
+                  firstuv := false;
+                  Buffer.add_string buf
+                    (Printf.sprintf "[\"%s\",%d]" (esc (Level.to_string u)) v)) g
+            with _ -> ());
            Buffer.add_string buf "],\"detyped_globs\":[";
            (try
               let env = Global.env () in
