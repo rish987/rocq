@@ -547,15 +547,60 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                                  back down. Without it we lifted `ex`'s type argument but
                                  left `P : A → Prop` behind, which is exactly the
                                  remaining mismatch. *)
-                              let rec coerce ty t =
+                              (* The ACTUAL type Coq gave this argument; `coerce`
+                                 compares it against the expected one so it can tell a
+                                 CODOMAIN sort mismatch (`P : A → Prop` where `A → Type`
+                                 is wanted) from a plain match. *)
+                              let act =
+                                try Reductionops.whd_all env evd
+                                      (Retyping.get_type_of env evd a)
+                                with _ -> dom' in
+                              (* Codomain of the actual type, when it is a product. *)
+                              let act_cod a0 =
+                                match kind evd a0 with
+                                | Constr.Prod (_, _, c) ->
+                                  (try Some (Reductionops.whd_all env evd c) with _ -> Some c)
+                                | _ -> None in
+                              let cod_is_prop a0 =
+                                match act_cod a0 with
+                                | Some c ->
+                                  (match kind evd c with
+                                   | Constr.Sort sa -> is_propish (ESorts.kind evd sa)
+                                   | _ -> false)
+                                | None -> false in
+                              let rec coerce ty act t =
                                 match kind evd ty with
                                 | Constr.Prod (na, d, cod)
                                   when List.exists (fun l -> eq_constr evd l d) !lifted ->
                                   incr r2l_downs;
-                                  let d1 = Vars.lift 1 (go env d) in
-                                  let arg = mk_down d1 (mkRel 1) in
-                                  mkLambda (na, mk_lift (go env d),
-                                            coerce cod (mkApp (Vars.lift 1 t, [| arg |])))
+                                  let d_o = go env d in
+                                  let arg = mk_down (Vars.lift 1 d_o) (mkRel 1) in
+                                  let body = mkApp (Vars.lift 1 t, [| arg |]) in
+                                  (* A `Sort` codomain carries no de Bruijn indices, so it
+                                     needs no substitution -- and it is exactly the case
+                                     that matters: the function RETURNS a type, and Coq's
+                                     returns a Prop where a Type is demanded. *)
+                                  let body =
+                                    match kind evd cod with
+                                    | Constr.Sort se
+                                      when not (is_propish (ESorts.kind evd se))
+                                        && cod_is_prop act ->
+                                      incr r2l_lifts; mk_lift body
+                                    | _ -> body in
+                                  mkLambda (na, mk_lift d_o,
+                                            (match kind evd cod with
+                                             | Constr.Sort _ -> body
+                                             | _ -> coerce cod (Option.default cod (act_cod act)) body))
+                                | Constr.Prod (na, d, cod)
+                                  when (match kind evd cod with
+                                        | Constr.Sort se -> not (is_propish (ESorts.kind evd se))
+                                        | _ -> false)
+                                    && cod_is_prop act ->
+                                  (* Domain unchanged, codomain sort differs: eta-expand and
+                                     lift the RESULT (`sigT nat P` with `P : nat → Prop`). *)
+                                  incr r2l_lifts;
+                                  mkLambda (na, go env d,
+                                            mk_lift (mkApp (Vars.lift 1 t, [| mkRel 1 |])))
                                 | _ ->
                                   if List.exists (fun l -> eq_constr evd l ty) !lifted
                                   then begin incr r2l_ups; mk_up (go env ty) t end
@@ -566,7 +611,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                                        `PLift.up (ex A …) p` where `p` already had the
                                        LIFTED type `ex (PLift A) …`. *)
                                     t in
-                              out.(i) <- coerce dom' out.(i));
+                              out.(i) <- coerce dom' act out.(i));
                            (* Substitute the ORIGINAL argument: the markers must never
                               reach Retyping/whd_all. *)
                            fty := Vars.subst1 a cod
