@@ -460,6 +460,124 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
               ALL arguments (an implicit type arg becomes an explicit GRef, not
               the `GHole GImplicitArg` intern emits) and drops source locs
               (loc:null). *)
+              (* rocq2lean: EXPLICIT CUMULATIVITY (Assaf, "A Calculus of
+                 Constructions with Explicit Subtyping", TYPES 2014).
+
+                 Coq's `Prop ⊆ Type` is SUBTYPING, applied silently by the kernel
+                 (`Typeops.type_of_apply` → `conv_leq`, whose sort case is
+                 `Conversion`'s `CUMUL -> check_leq`). Lean has no subtyping at all,
+                 so once we render universe levels faithfully every such use is a hard
+                 error. This pass makes each one EXPLICIT in the term BEFORE detyping,
+                 so the glob carries it and the translator needs no new logic.
+
+                 We do NOT hook conversion: it is memoized and short-circuits (an
+                 argument that converts syntactically never reaches the sort
+                 comparison), it is called speculatively, and it has no positional
+                 handle. A type-directed traversal is deterministic and positional.
+
+                 Two markers, fabricated (they need not exist in the environment --
+                 nothing typechecks the OUTPUT, we only detype it). Crucially the
+                 markers are never fed back into typing: `Retyping`/`whd_all` always
+                 see the ORIGINAL subterms, and the rewritten ones only accumulate in
+                 the output. R2L.lift is Assaf's ↑ (a Prop used as a Type); R2L.up
+                 injects an element into a lifted type. *)
+              let r2l_mp =
+                Names.ModPath.MPfile (Names.DirPath.make [Names.Id.of_string "R2L"]) in
+              let r2l_lift_c =
+                Names.Constant.make1 (Names.KerName.make r2l_mp (Names.Label.make "lift")) in
+              let r2l_up_c =
+                Names.Constant.make1 (Names.KerName.make r2l_mp (Names.Label.make "up")) in
+              let r2l_down_c =
+                Names.Constant.make1 (Names.KerName.make r2l_mp (Names.Label.make "down")) in
+              let r2l_lifts = ref 0 and r2l_ups = ref 0 and r2l_fails = ref 0 in
+              let r2l_downs = ref 0 in
+              let r2l_apps = ref 0 in
+              let r2l_explicitate env evd c0 =
+                let open EConstr in
+                let mk_lift a = mkApp (UnsafeMonomorphic.mkConst r2l_lift_c, [| a |]) in
+                let mk_up t a = mkApp (UnsafeMonomorphic.mkConst r2l_up_c, [| t; a |]) in
+                let mk_down t a = mkApp (UnsafeMonomorphic.mkConst r2l_down_c, [| t; a |]) in
+                let is_propish s = Sorts.is_prop s || Sorts.is_sprop s in
+                let rec go env c =
+                  match kind evd c with
+                  | Constr.App (f, args) ->
+                    incr r2l_apps;
+                    let f' = go env f in
+                    let out = Array.map (go env) args in
+                    (try
+                       let fty = ref (Retyping.get_type_of env evd f) in
+                       (* Original arg values whose SORT we lifted; a later argument
+                          whose expected type is one of them is an ELEMENT of a lifted
+                          type and needs `up`. Tracking values (not de Bruijn indices)
+                          keeps this independent of the telescope's shape. *)
+                       let lifted = ref [] in
+                       Array.iteri (fun i a ->
+                         match kind evd (Reductionops.whd_all env evd !fty) with
+                         | Constr.Prod (_, dom, cod) ->
+                           let dom' = Reductionops.whd_all env evd dom in
+                           (match kind evd dom' with
+                            | Constr.Sort sdom ->
+                              (* TYPE-argument position. *)
+                              let aty =
+                                Reductionops.whd_all env evd
+                                  (Retyping.get_type_of env evd a) in
+                              (match kind evd aty with
+                               | Constr.Sort sa
+                                 when is_propish (ESorts.kind evd sa)
+                                   && not (is_propish (ESorts.kind evd sdom)) ->
+                                 out.(i) <- mk_lift out.(i);
+                                 lifted := a :: !lifted;
+                                 incr r2l_lifts
+                               | _ -> ())
+                            | _ ->
+                              (* Assaf's coercion, transporting the argument from the
+                                 type Coq gave it to the type the LIFTED signature now
+                                 demands. `lifted` holds the type arguments we already
+                                 lifted in THIS telescope, and the expected type here is
+                                 still in original (unlifted) terms, so a lifted value
+                                 occurring in it marks where transport is needed.
+
+                                   ty = A          (A lifted)  ->  up A a
+                                   ty = ∀(x:A), B  (A lifted)  ->  fun (x : ↑A) => <coerce (a (down A x)) B>
+
+                                 The second is the Π case of full reflection: `↑` does
+                                 not commute with `→` in Lean (`PLift (A → B)` and
+                                 `PLift A → PLift B` are different types), so the
+                                 function must be eta-expanded and its argument brought
+                                 back down. Without it we lifted `ex`'s type argument but
+                                 left `P : A → Prop` behind, which is exactly the
+                                 remaining mismatch. *)
+                              let rec coerce ty t =
+                                match kind evd ty with
+                                | Constr.Prod (na, d, cod)
+                                  when List.exists (fun l -> eq_constr evd l d) !lifted ->
+                                  incr r2l_downs;
+                                  let d1 = Vars.lift 1 d in
+                                  let arg = mk_down d1 (mkRel 1) in
+                                  mkLambda (na, mk_lift d,
+                                            coerce cod (mkApp (Vars.lift 1 t, [| arg |])))
+                                | _ ->
+                                  if List.exists (fun l -> eq_constr evd l ty) !lifted
+                                  then begin incr r2l_ups; mk_up ty t end
+                                  else t in
+                              out.(i) <- coerce dom' out.(i));
+                           (* Substitute the ORIGINAL argument: the markers must never
+                              reach Retyping/whd_all. *)
+                           fty := Vars.subst1 a cod
+                         | _ -> ()) args
+                     with _ -> incr r2l_fails);
+                    mkApp (f', out)
+                  | _ ->
+                    (* EVERY other node, with the environment maintained correctly
+                       through ALL binder forms -- `Case` branches and `Fix` included.
+                       Hand-rolling only Lambda/Prod/LetIn left the env wrong under
+                       every match and every recursive function, so `Retyping` threw
+                       there and the whole application was skipped: 1252 retype
+                       failures in `Init/Logic` alone, i.e. exactly the sites that
+                       stayed unlifted. *)
+                    Termops.map_constr_with_full_binders env evd push_rel go env c
+                in
+                try go env c0 with _ -> incr r2l_fails; c0 in
            Buffer.add_string buf "],\"detyped_globs\":[";
            (try
               let env = Global.env () in
@@ -676,7 +794,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                        let gc =
                          Flags.with_options [Flags.raw_print; Detyping.print_universes]
                            (Detyping.detype Detyping.Now env evd)
-                           (EConstr.of_constr body) in
+                           (r2l_explicitate env evd (EConstr.of_constr body)) in
                        let j = jg gc in
                        if not !firstg then Buffer.add_char buf ',';
                        firstg := false;
@@ -700,7 +818,8 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                      let gc =
                        Flags.with_options [Flags.raw_print; Detyping.print_universes]
                          (Detyping.detype Detyping.Now env evd)
-                         (EConstr.of_constr cb.Declarations.const_type) in
+                         (r2l_explicitate env evd
+                            (EConstr.of_constr cb.Declarations.const_type)) in
                      let j = jg gc in
                      if not !firstt then Buffer.add_char buf ',';
                      firstt := false;
@@ -736,7 +855,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                          ^ Names.Id.to_string oib.Declarations.mind_typename in
                        let dj t = jg (Flags.with_options [Flags.raw_print; Detyping.print_universes]
                                         (Detyping.detype Detyping.Now env evd)
-                                        (EConstr.of_constr t)) in
+                                        (r2l_explicitate env evd (EConstr.of_constr t))) in
                        let arity_g = dj ind_ty in
                        let ctors_j = String.concat "," (Array.to_list (Array.mapi (fun j cty ->
                          Printf.sprintf "[\"%s\",%s]"
@@ -947,6 +1066,10 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 (Global.r2l_structure_order ())
             with _ -> ());
            Buffer.add_string buf "]}";
+           (* rocq2lean: explicit-cumulativity counters (R2L_TRACE_LIFT). *)
+           if Option.has_some (Sys.getenv_opt "R2L_TRACE_LIFT") then
+             Printf.eprintf "[R2L-LIFT] %s: lifts=%d ups=%d downs=%d apps=%d retype_fail=%d\n%!"
+               meta_file !r2l_lifts !r2l_ups !r2l_downs !r2l_apps !r2l_fails;
            let oc = open_out meta_file in
            output_string oc (Buffer.contents buf); close_out oc
          with _ -> ());
