@@ -491,6 +491,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 Names.Constant.make1 (Names.KerName.make r2l_mp (Names.Label.make "down")) in
               let r2l_lifts = ref 0 and r2l_ups = ref 0 and r2l_fails = ref 0 in
               let r2l_downs = ref 0 in
+              let r2l_scruts = ref 0 in
               let r2l_apps = ref 0 in
               let r2l_explicitate env evd c0 =
                 let open EConstr in
@@ -618,6 +619,35 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                          | _ -> ()) args
                      with _ -> incr r2l_fails);
                     mkApp (f', out)
+                  | Constr.Case _ ->
+                    (* SCRUTINEE TYPE for an INDEXED match. Lean needs the index TERMS
+                       as discriminants so each branch can refine them, and the glob
+                       does not carry them -- the `in`-clause (`aliastyp`) names the
+                       index binders but not their values. The translator used to
+                       recover them by elaborating the scrutinee in the live Lean
+                       environment, `inferType`ing it and DELABORATING the index args
+                       back to syntax; that round trip is what exposed it to Lean's
+                       `sorry`s and to unbound universe names.
+                       Ascribing the scrutinee with the type it ALREADY has is a
+                       semantic no-op that survives detyping as a `GCast`, so the type
+                       -- and hence its index arguments -- arrives as an ordinary glob
+                       the translator can render through its normal path. Only for
+                       inductives that actually have indices; anywhere else it is
+                       noise. *)
+                    let c' =
+                      Termops.map_constr_with_full_binders env evd push_rel go env c in
+                    (match kind evd c' with
+                     | Constr.Case (ci, u, pms, p, iv, scrut, brs) ->
+                       (try
+                          let (_, oib) = Inductive.lookup_mind_specif env ci.Constr.ci_ind in
+                          if oib.Declarations.mind_nrealargs = 0 then c'
+                          else
+                            let sty = Retyping.get_type_of env evd scrut in
+                            incr r2l_scruts;
+                            mkCase (ci, u, pms, p, iv,
+                                    mkCast (scrut, Constr.DEFAULTcast, sty), brs)
+                        with _ -> c')
+                     | _ -> c')
                   | _ ->
                     (* EVERY other node, with the environment maintained correctly
                        through ALL binder forms -- `Case` branches and `Fix` included.
@@ -708,8 +738,21 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                       | Some at ->
                         let (ind, nas) = at.CAst.v in
                         jarr [jind ind; jarr (List.map jname nas)] in
+                    (* rocq2lean: the SCRUTINEE'S TYPE, as a third element. The
+                       explicitation pass ascribes an indexed match's scrutinee with the
+                       type it already has (a semantic no-op), so the type is available
+                       here as a `GCast`. `jg` renders `GCast` TRANSPARENTLY -- which is
+                       what we want for the scrutinee itself, and is also why the
+                       ascription is invisible unless read out explicitly, as here.
+                       Gives the translator the index TERMS (the type's arguments past
+                       `nparams`) directly, instead of elaborating the scrutinee in the
+                       live Lean environment and delaborating them back. *)
                     let jtom (scrut, (na, aty)) =
-                      jarr [jg scrut; jarr [jname na; jaliastyp aty]] in
+                      let sty =
+                        match DAst.get scrut with
+                        | Glob_term.GCast (_, _, t) -> jg t
+                        | _ -> "null" in
+                      jarr [jg scrut; jarr [jname na; jaliastyp aty]; sty] in
                     let jclause cl =
                       let (ids, pats, body) = cl.CAst.v in
                       "{\"v\":" ^ jarr [ jarr (List.map jid ids);
@@ -1119,8 +1162,8 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
            Buffer.add_string buf "]}";
            (* rocq2lean: explicit-cumulativity counters (R2L_TRACE_LIFT). *)
            if Option.has_some (Sys.getenv_opt "R2L_TRACE_LIFT") then
-             Printf.eprintf "[R2L-LIFT] %s: lifts=%d ups=%d downs=%d apps=%d retype_fail=%d\n%!"
-               meta_file !r2l_lifts !r2l_ups !r2l_downs !r2l_apps !r2l_fails;
+             Printf.eprintf "[R2L-LIFT] %s: lifts=%d ups=%d downs=%d scruts=%d apps=%d retype_fail=%d\n%!"
+               meta_file !r2l_lifts !r2l_ups !r2l_downs !r2l_scruts !r2l_apps !r2l_fails;
            let oc = open_out meta_file in
            output_string oc (Buffer.contents buf); close_out oc
          with _ -> ());
