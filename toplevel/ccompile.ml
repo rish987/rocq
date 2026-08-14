@@ -816,8 +816,32 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 | Glob_term.GHole _ -> jarr [jstr "GHole"; jarr [jstr "GInternalHole"]]
                 | Glob_term.GProj (_, args, c) ->
                     jarr (jstr "GApp" :: jg c :: [jarr (List.map jg args)])
-                | Glob_term.GInt _ | Glob_term.GFloat _ | Glob_term.GString _ ->
-                    jarr [jstr "GHole"; jarr [jstr "GInternalHole"]]
+                (* rocq2lean: PRIMITIVE LITERALS. These used to be dropped as an
+                   anonymous GHole — the SAME tag as a genuine hole, so the consumer
+                   could not even detect the loss — and `63%uint63` reached the
+                   translator as `_`. That was 69 of corelib's 200 elaboration
+                   errors, and a silent-mistranslation hazard wherever Lean managed
+                   to solve the hole. Emit them structurally instead.
+                   `Uint63.to_string` is the exact UNSIGNED decimal (the signed
+                   reading of e.g. `lsl 1 62` would be wrong). `Float64.to_string`
+                   is "%.17g", which round-trips binary64, and yields
+                   "nan"/"infinity"/"neg_infinity" for the specials; the hex form
+                   rides along as an exact audit trail. *)
+                | Glob_term.GInt i ->
+                    jarr [jstr "GInt"; jstr (Uint63.to_string i)]
+                | Glob_term.GFloat f ->
+                    jarr [jstr "GFloat"; jstr (Float64.to_string f);
+                                         jstr (Float64.to_hex_string f)]
+                | Glob_term.GString s ->
+                    (* HEX, not `jstr` on the raw bytes: a Coq pstring is a BYTE
+                       string, and `esc` above passes bytes >= 0x80 through raw —
+                       which emits invalid UTF-8 and can make the WHOLE metadata
+                       file unparseable, whereupon the consumer swallows the parse
+                       failure and proceeds with NO metadata for the file. *)
+                    let bs = Pstring.to_string s in
+                    let hex = String.concat "" (List.init (String.length bs)
+                                (fun k -> Printf.sprintf "%02x" (Char.code bs.[k]))) in
+                    jarr [jstr "GString"; jstr hex]
                 (* rocq2lean: FIXPOINT bodies. A `Fixpoint`'s constant body is a
                    kernel `Fix`, which detypes to `GRec` — and the catch-all below
                    used to serialize it as a HOLE, so EVERY recursive definition
