@@ -1091,6 +1091,32 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                     mib.Declarations.mind_packets
                 with _ -> ()) r2l_minds
             with _ -> ());
+           (* rocq2lean: Coq's PARAMETER COUNT for every inductive this file REFERENCES.
+              `detyped_inductives` carries nparams only for inductives DEFINED here, so a
+              dependent match on a CROSS-FILE inductive (`bool` inside `Decimal`) left the
+              consumer unable to split the scrutinee's type args into params vs indices,
+              and `dependentMatchRedex?` had to fail closed. Lean's own `numParams` is NOT
+              a substitute: the split must match COQ's view (the motive's binder names come
+              from Coq's `in`-clause) and the translation can demote a Coq parameter into a
+              Lean index. Keyed exactly like `inductive_ctor_names` above — note that is
+              globIds order (innermost-first), which the consumer must REVERSE to match a
+              Lean name. *)
+           Buffer.add_string buf "],\"referenced_nparams\":[";
+           (try
+              let env = Global.env () in
+              let firstnp = ref true in
+              Hashtbl.iter (fun key mi ->
+                try
+                  let mib = Environ.lookup_mind mi env in
+                  Array.iteri (fun i _oib ->
+                    if not !firstnp then Buffer.add_char buf ',';
+                    firstnp := false;
+                    Buffer.add_string buf
+                      (Printf.sprintf "[\"%s#%d\",%d]" (esc key) i
+                         mib.Declarations.mind_nparams))
+                    mib.Declarations.mind_packets
+                with _ -> ()) r2l_minds
+            with _ -> ());
            (* rocq2lean: DECLARED COERCIONS with their SOURCE and TARGET classes, resolved.
               The translator otherwise has to read `Coercion tm_var : string >-> tm.` off the
               SURFACE vernac, where `string`/`tm` are BARE qualids with no qualification and
