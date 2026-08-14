@@ -737,10 +737,56 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 | Glob_term.Explicit -> jarr [jstr "Explicit"]
                 | Glob_term.MaxImplicit -> jarr [jstr "MaxImplicit"]
                 | Glob_term.NonMaxImplicit -> jarr [jstr "NonMaxImplicit"] in
+              (* rocq2lean: hoisted out of the `GSort` branch so `GRef`'s universe
+                 INSTANCE can be serialized in exactly the same shape (see `juinst`). *)
+              let jsortname = function
+                | Glob_term.GSProp        -> jstr "SProp"
+                | Glob_term.GProp         -> jstr "Prop"
+                | Glob_term.GSet          -> jstr "Set"
+                | Glob_term.GUniv l       -> jstr (Univ.Level.to_string l)
+                | Glob_term.GRawUniv l    -> jstr (Univ.Level.to_string l)
+                | Glob_term.GLocalUniv id -> jstr (Names.Id.to_string id.CAst.v) in
+              (* rocq2lean: the UNIVERSE INSTANCE at a `GRef` occurrence.
+                 `GRef` is `GlobRef.t * glob_instance option`, and the second
+                 component was being thrown away wholesale -- so every occurrence of a
+                 universe-polymorphic constant reached the consumer with its instance
+                 erased, and the only thing left to do with it was to let Lean guess.
+                 Lean's universe unifier is essentially syntactic and will not INVENT a
+                 `max` for a metavariable, which is exactly the "stuck at solving
+                 universe constraint" shape in CMorphisms.
+
+                 `glob_instance = glob_quality list * glob_level list`; a `glob_level`
+                 is `glob_sort_name glob_sort_gen`, i.e. `UAnonymous` (nothing to name)
+                 or `UNamed <sort name>`. Emitted as
+                   null | [[<quality>, ...], [<level>, ...]]
+                 where a level is `null` (anonymous) or `[<name>, 0]`. The `0` is the
+                 GSort levels' INCREMENT slot, kept so the consumer shares one decoder;
+                 an instance level never carries an increment (an instance holds ATOMIC
+                 levels -- Coq expresses `max` through constraints, not here).
+
+                 As with `GSort`, `Detyping.detype_instance` returns `None` unless
+                 `Detyping.print_universes` is set -- which the sidecar already does. *)
+              let jquality = function
+                | Glob_term.GQConstant q ->
+                    jstr (Sorts.Quality.Constants.pr q |> Pp.string_of_ppcmds)
+                | Glob_term.GQualVar (Glob_term.GLocalQVar id) ->
+                    (match id.CAst.v with
+                     | Names.Name.Anonymous -> jstr "_"
+                     | Names.Name.Name i -> jstr (Names.Id.to_string i))
+                | Glob_term.GQualVar (Glob_term.GQVar q)
+                | Glob_term.GQualVar (Glob_term.GRawQVar q) ->
+                    jstr (Sorts.QVar.to_string q) in
+              let jglevel = function
+                | Glob_term.UAnonymous _ -> "null"
+                | Glob_term.UNamed n -> jarr [jsortname n; "0"] in
+              let juinst = function
+                | None -> "null"
+                | Some (qs, us) ->
+                    jarr [jarr (List.map jquality qs); jarr (List.map jglevel us)] in
               let wrap node = "{\"v\":" ^ node ^ ",\"loc\":null}" in
               let rec jg gc = wrap (jnode (DAst.get gc))
               and jnode = function
-                | Glob_term.GRef (gr, _) -> jarr [jstr "GRef"; jgref gr; "null"]
+                | Glob_term.GRef (gr, u) -> jarr [jstr "GRef"; jgref gr; juinst u]
                 | Glob_term.GVar id -> jarr [jstr "GVar"; jid id]
                 | Glob_term.GApp (f, args) ->
                     jarr [jstr "GApp"; jg f; jarr (List.map jg args)]
@@ -821,13 +867,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                        `Detyping.print_universes` is set -- otherwise it returns the
                        anonymous `glob_Type_sort` and there is nothing here to serialize.
                        Shape: null (anonymous/flexible) | [[name, increment], ...] (a max). *)
-                    let jsortname = function
-                      | Glob_term.GSProp        -> jstr "SProp"
-                      | Glob_term.GProp         -> jstr "Prop"
-                      | Glob_term.GSet          -> jstr "Set"
-                      | Glob_term.GUniv l       -> jstr (Univ.Level.to_string l)
-                      | Glob_term.GRawUniv l    -> jstr (Univ.Level.to_string l)
-                      | Glob_term.GLocalUniv id -> jstr (Names.Id.to_string id.CAst.v) in
+                    (* `jsortname` is hoisted above (shared with `GRef`'s instance). *)
                     let juniv = (match u with
                       | Glob_term.UAnonymous _ -> "null"
                       | Glob_term.UNamed l ->
