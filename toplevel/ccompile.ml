@@ -133,9 +133,29 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
            let r2l_note_mind mi =
              let k = r2l_mind_key mi in
              if not (Hashtbl.mem r2l_minds k) then Hashtbl.add r2l_minds k mi in
+           (* rocq2lean: the CONSTANT twin of `r2l_minds`, keyed the same way
+              (`".".intercalate (globIds <Constant>)`, no `#idx` suffix — a constant is
+              not a block). Drained into `referenced_sorts`, which needs the codomain
+              sort of every referenced gref, not just of the inductives: deciding
+              whether `prod (is_true (R z z)) (…)` is a Prop instance turns on
+              `is_true : bool -> Prop`, a CROSS-FILE constant that no file-local key
+              (`constant_sorts`, `detyped_type_globs`) can supply. *)
+           let r2l_consts : (string, Names.Constant.t) Hashtbl.t = Hashtbl.create 97 in
+           let r2l_kername_key kn =
+             let mp, lbl = Names.KerName.repr kn in
+             let rec ids = function
+               | Names.ModPath.MPfile dp ->
+                   List.map Names.Id.to_string (Names.DirPath.repr dp)
+               | Names.ModPath.MPbound _ -> []
+               | Names.ModPath.MPdot (mp, l) -> ids mp @ [Names.Label.to_string l] in
+             String.concat "." (ids mp @ [Names.Label.to_string lbl]) in
+           let r2l_note_const c =
+             let k = r2l_kername_key (Names.Constant.user c) in
+             if not (Hashtbl.mem r2l_consts k) then Hashtbl.add r2l_consts k c in
            let r2l_note_gref = function
              | Names.GlobRef.IndRef (mi, _)
              | Names.GlobRef.ConstructRef ((mi, _), _) -> (try r2l_note_mind mi with _ -> ())
+             | Names.GlobRef.ConstRef c -> (try r2l_note_const c with _ -> ())
              | _ -> () in
            (* rocq2lean: a GlobRef's FULLY QUALIFIED name. `Printer.pr_global` gives
               the nametab's SHORTEST name (`ANum`), which the consumer can neither
@@ -692,6 +712,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                 let mp, l = Names.KerName.repr kn in
                 jarr [jstr "KerName"; jmodpath mp; jlbl l] in
               let jconstant c =
+                r2l_note_const c;
                 let cu = Names.Constant.user c and cc = Names.Constant.canonical c in
                 if Names.KerName.equal cu cc
                 then jarr [jstr "Constant"; jkername cu; "null"]
@@ -1117,6 +1138,149 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                     mib.Declarations.mind_packets
                 with _ -> ()) r2l_minds
             with _ -> ());
+           (* rocq2lean: TEMPLATE POLYMORPHISM, for every inductive this file REFERENCES.
+              Rocq's `sig`/`sigT`/`prod`/… are ONE declaration whose result sort is
+              recomputed per occurrence from the sorts of the actual parameters, so
+              `{x : A | P x}` is `Prop` when `A : Prop` and `Type@{A.u0}` otherwise.
+              Lean has no such thing: a declaration has ONE type, and Lean REJECTS the
+              template supremum outright ("the resulting universe is not `Prop`, but it
+              may be `Prop` for some parameter values"), forcing the `max 1` floor. At a
+              Prop instance we are therefore exactly one level too high. The translator
+              repairs that by emitting a SEPARATE Prop-sorted mirror declaration, but it
+              may only do so where Rocq itself says "template" — sort INFERENCE over the
+              constructor fields is NOT a substitute (`sumbool`'s fields are all proofs,
+              yet it is a non-singleton `Set` that must keep large elimination).
+              Emitted as [key#blockIdx, [per-param 0|1], propInstance, "<concl sort>"],
+              keyed exactly like `referenced_nparams` above (globIds order, consumer
+              reverses). The per-param mask is `template_param_arguments`: 1 where that
+              LocalAssum parameter binds a quality or universe level, i.e. exactly the
+              parameters the Prop instance sends to `Prop`. Non-template blocks emit NO
+              entry at all.
+
+              `propInstance` is the field that decides whether a mirror is SOUND, and it
+              is computed HERE rather than by string-matching the printed sort, because
+              the distinction is invisible in the parameter mask. Template blocks split
+              into three kinds, and only the first has a Prop instance:
+                sig/sig2/sigT/sigT2/prod  concl `QSort(β0, …)` — the sort QUALITY itself
+                                          is abstracted, so instantiating it at Prop makes
+                                          the whole thing Prop.  MIRROR.
+                list/option/sum           concl `Type(max(Set, …))` — quality is a
+                                          CONSTANT QType with a `Set` FLOOR, so the Prop
+                                          instance is still `Set`, never Prop. NO mirror
+                                          (a `list` in Prop would be flatly unsound).
+                eq/ex                     concl `Prop` already; nothing to repair.
+              So `propInstance` = "the concl's quality is a QVar", i.e. template-abstracted.
+              `sumbool` is not template AT ALL and thus emits no entry — which is exactly
+              why the gate must be Rocq's answer and never sort inference over the ctor
+              fields (its fields are all proofs, yet it is a non-singleton `Set` that must
+              keep large elimination). *)
+           Buffer.add_string buf "],\"template_polymorphic\":[";
+           (try
+              let env = Global.env () in
+              let firsttp = ref true in
+              Hashtbl.iter (fun key mi ->
+                (* No silent `with _ -> ()`: a swallowed failure here becomes a MISSING
+                   entry, and a missing entry silently disables the mirror for that
+                   inductive — a symptom that would surface far from its cause. *)
+                match (try Some (Environ.lookup_mind mi env) with e ->
+                         Printf.eprintf
+                           "rocq2lean: template_polymorphic: lookup_mind %s failed: %s\n"
+                           key (Printexc.to_string e); None) with
+                | None -> ()
+                | Some mib ->
+                  (match mib.Declarations.mind_template with
+                   | None -> ()
+                   | Some tu ->
+                     let mask = String.concat ","
+                       (List.map (function None -> "0" | Some _ -> "1")
+                          tu.Declarations.template_param_arguments) in
+                     let concl =
+                       Pp.string_of_ppcmds
+                         (Sorts.debug_print tu.Declarations.template_concl) in
+                     let prop_instance =
+                       if Sorts.Quality.is_var
+                            (Sorts.quality tu.Declarations.template_concl)
+                       then 1 else 0 in
+                     Array.iteri (fun i _oib ->
+                       if not !firsttp then Buffer.add_char buf ',';
+                       firsttp := false;
+                       Buffer.add_string buf
+                         (Printf.sprintf "[\"%s#%d\",[%s],%d,\"%s\"]"
+                            (esc key) i mask prop_instance (esc concl)))
+                       mib.Declarations.mind_packets)) r2l_minds
+            with e ->
+              Printf.eprintf "rocq2lean: template_polymorphic key FAILED: %s\n"
+                (Printexc.to_string e));
+           (* rocq2lean: the CODOMAIN SORT FAMILY of every gref this file REFERENCES —
+              peel the `∀`s off the constant's type / the inductive's arity and report the
+              sort you land on ("Prop"/"SProp"/"Set"/"Type"), or nothing at all when the
+              codomain is not a sort (a theorem's type lands on a PROPOSITION, not on a
+              sort — applying it yields a proof, so the absence is the correct answer and
+              the consumer must fail closed on it).
+
+              This is what lets the consumer decide, WITHOUT a live Lean environment,
+              whether a template inductive's occurrence is at a Prop instance: it walks
+              the argument's glob down to a head gref and reads that head's codomain sort.
+              Both existing sorts of key are file-local and so cannot do it —
+              `constant_sorts` reports the sort of a constant's WHOLE type (`Type` for
+              `is_true : bool -> Prop`, the opposite of what is asked) and only for
+              constants DECLARED here, and `detyped_type_globs` is likewise this file's
+              own. The decisive cases are all cross-file: `is_true` from `Datatypes` seen
+              from `ssrbool`, `eq` from `Logic` seen from `Specif`.
+
+              Keys are the RAW globIds form (innermost-first), `"<key>#<blockIdx>"` for an
+              inductive and bare for a constant, so a consumer holding a glob `GRef` node
+              matches by `".".intercalate (globIds …)` with no reversal. *)
+           Buffer.add_string buf "],\"referenced_sorts\":[";
+           (try
+              let env = Global.env () in
+              let firstrs = ref true in
+              let fam s =
+                if Sorts.is_sprop s then Some "SProp"
+                else if Sorts.is_prop s then Some "Prop"
+                else if Sorts.is_set s then Some "Set"
+                else match Sorts.quality s with
+                  | Sorts.Quality.QConstant Sorts.Quality.QType -> Some "Type"
+                  (* A quality VARIABLE (template/sort-polymorphic) has no fixed answer;
+                     say nothing rather than guess `Type`. *)
+                  | _ -> None in
+              let rec codom t =
+                match Constr.kind t with
+                | Constr.Prod (_, _, b) -> codom b
+                | Constr.LetIn (_, _, _, b) -> codom b
+                | Constr.Cast (c, _, _) -> codom c
+                | Constr.Sort s -> fam s
+                | _ -> None in
+              let emit k v =
+                if not !firstrs then Buffer.add_char buf ',';
+                firstrs := false;
+                Buffer.add_string buf
+                  (Printf.sprintf "[\"%s\",\"%s\"]" (esc k) (esc v)) in
+              Hashtbl.iter (fun key mi ->
+                match (try Some (Environ.lookup_mind mi env) with e ->
+                         Printf.eprintf
+                           "rocq2lean: referenced_sorts: lookup_mind %s failed: %s\n"
+                           key (Printexc.to_string e); None) with
+                | None -> ()
+                | Some mib ->
+                  Array.iteri (fun i oib ->
+                    match fam oib.Declarations.mind_sort with
+                    | None -> ()
+                    | Some f -> emit (Printf.sprintf "%s#%d" key i) f)
+                    mib.Declarations.mind_packets) r2l_minds;
+              Hashtbl.iter (fun key c ->
+                match (try Some (Environ.lookup_constant c env) with e ->
+                         Printf.eprintf
+                           "rocq2lean: referenced_sorts: lookup_constant %s failed: %s\n"
+                           key (Printexc.to_string e); None) with
+                | None -> ()
+                | Some cb ->
+                  (match codom cb.Declarations.const_type with
+                   | None -> ()
+                   | Some f -> emit key f)) r2l_consts
+            with e ->
+              Printf.eprintf "rocq2lean: referenced_sorts key FAILED: %s\n"
+                (Printexc.to_string e));
            (* rocq2lean: DECLARED COERCIONS with their SOURCE and TARGET classes, resolved.
               The translator otherwise has to read `Coercion tm_var : string >-> tm.` off the
               SURFACE vernac, where `string`/`tm` are BARE qualids with no qualification and
