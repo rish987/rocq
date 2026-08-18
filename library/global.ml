@@ -166,7 +166,13 @@ let r2l_structure_order () =
      (* `structure_body_of_safe_env` is `revstruct`: most recent declaration first. *)
      walk (Safe_typing.current_modpath senv)
        (List.rev (Safe_typing.structure_body_of_safe_env senv))
-   with _ -> ());
+   (* rocq2lean: LOUD. A swallowed failure here yields an EMPTY `declaration_order`,
+      and the driver synthesizes its entire statement array from that key — so the
+      file translates to NOTHING while the compile still succeeds. Whatever partial
+      walk we have is still returned; the point is that the loss is observable. *)
+   with e ->
+     Printf.eprintf "rocq2lean: r2l_structure_order ABORTED (declaration_order will be \
+                     truncated): %s\n%!" (Printexc.to_string e));
   List.rev !acc
 
 let open_section () = globalize0 Safe_typing.open_section
