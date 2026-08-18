@@ -52,11 +52,21 @@ val export_private_constants :
   Safe_typing.private_constants ->
   Safe_typing.exported_private_constant list
 
-(* rocq2lean: the current library's constants/inductives in DECLARATION order
-   (`("const"|"ind", kername)`), read off the safe environment's structure body and
-   consumed by ccompile.ml for the `declaration_order` sidecar key. Rooted at the current
-   modpath, so it only ever reports this compilation unit's own declarations. *)
-val r2l_structure_order : unit -> (string * string) list
+(* rocq2lean: the current library's constants/inductives in DECLARATION order,
+   read off the safe environment's structure body and consumed by ccompile.ml for the
+   `declaration_order` sidecar key. Rooted at the current modpath, so it only ever
+   reports this compilation unit's own declarations.
+
+   Each entry is `(kind, name, block_index, block_name)`:
+     - `kind`        = "const" | "ind";
+     - `name`        = the kername (for an inductive: modpath + the packet's own
+                       `mind_typename`, i.e. the `detyped_inductives` spelling);
+     - `block_index` = the member's index in its MUTUAL inductive block (0 for a
+                       constant and for a non-mutual inductive);
+     - `block_name`  = the block's own field kername ("" for a constant), so all
+                       members of one mutual block share a key the consumer can
+                       group by into a single Lean `mutual … end`. *)
+val r2l_structure_order : unit -> (string * string * int * string) list
 
 val add_constant :
   ?typing_flags:typing_flags ->

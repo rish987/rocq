@@ -135,8 +135,25 @@ let r2l_structure_order () =
     List.iter (fun (l, field) ->
       let name = Names.ModPath.to_string mp ^ "." ^ Names.Label.to_string l in
       match field with
-      | Declarations.SFBconst _ -> acc := ("const", name) :: !acc
-      | Declarations.SFBmind _ -> acc := ("ind", name) :: !acc
+      | Declarations.SFBconst _ -> acc := ("const", name, 0, "") :: !acc
+      (* rocq2lean: ONE ROW PER BLOCK MEMBER. A MUTUAL inductive is a SINGLE
+         `SFBmind` field, labelled after its FIRST member, so recording the
+         field alone left every non-first member (`Odd_alt` of the
+         `Even_alt`/`Odd_alt` block) ABSENT from `declaration_order` — and the
+         driver synthesizes its whole statement array from this key, so such a
+         member was never emitted at all. Each member is named exactly the way
+         `detyped_inductives` names it (modpath + the packet's OWN
+         `mind_typename`) and carries its BLOCK INDEX plus the block's field
+         name, so the consumer can regroup one block's members into a single
+         Lean `mutual … end`. A non-mutual inductive has exactly one packet
+         whose typename IS the field label, so its row is unchanged. *)
+      | Declarations.SFBmind mib ->
+        Array.iteri (fun i oib ->
+          let mname =
+            Names.ModPath.to_string mp ^ "."
+            ^ Names.Id.to_string oib.Declarations.mind_typename in
+          acc := ("ind", mname, i, name) :: !acc)
+          mib.Declarations.mind_packets
       | Declarations.SFBmodule mb ->
         (match Mod_declarations.mod_type mb with
          | Declarations.NoFunctor sb' -> walk (Names.ModPath.MPdot (mp, l)) sb'

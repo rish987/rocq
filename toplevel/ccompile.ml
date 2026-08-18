@@ -215,6 +215,10 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
               rather than guessing (the `Z`-module-vs-inductive collision). Deduped
               by span. Source: `Constrintern.take_ref_resolutions`. *)
            Buffer.add_string buf "],\"ref_resolutions\":[";
+           (* rocq2lean: how many occurrences could NOT be named (see below). Emitted
+              into the sidecar as `ref_resolutions_skipped` so a consumer can tell
+              "this file has no unresolvable refs" from "the emitter gave up". *)
+           let ref_res_skipped = ref 0 in
            (try
               let env = Global.env () in
               let gref_name = function
@@ -241,20 +245,51 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                   let (bp, ep) = Loc.unloc l in
                   r2l_note_gref gref;
                   if not (Hashtbl.mem seen (bp, ep)) then begin
-                    Hashtbl.add seen (bp, ep) ();
-                    if not !firstr then Buffer.add_char buf ',';
-                    firstr := false;
-                    Buffer.add_string buf
-                      (Printf.sprintf "[%d,%d,\"%s\"]" bp ep (esc (gref_name gref)))
+                    (* rocq2lean: NAME THE REF FIRST, and catch PER ENTRY.
+                       `gref_name` calls `Environ.lookup_mind`, which RAISES for an
+                       inductive declared inside a FUNCTOR BODY (`Module M (X : S).
+                       Inductive box … End M.`): the block's kername lives under an
+                       MPbound modpath and is absent from the final global env.
+                       Two rules this code got wrong before, and must keep:
+                         (a) the separator comma is written only when an entry is
+                             actually appended, so a failure can never strand a
+                             comma — the old code wrote `,` BEFORE evaluating
+                             `gref_name`, and the raise then truncated the array
+                             mid-write, leaving `…],]` → the WHOLE sidecar was
+                             unparseable JSON → the file translated to NOTHING
+                             (7 of 254 VST-closure files; `compcert/lib/Integers`
+                             alone = 1,679 declarations);
+                         (b) a failure skips exactly ONE occurrence instead of
+                             abandoning the array, and is LOUD (stderr + a count in
+                             the sidecar) — a silent skip is how this class of bug
+                             hides. *)
+                    match (try Some (gref_name gref) with e ->
+                             incr ref_res_skipped;
+                             Printf.eprintf
+                               "rocq2lean: ref_resolutions: cannot name the ref at \
+                                %d-%d (skipped): %s\n"
+                               bp ep (Printexc.to_string e);
+                             None) with
+                    | None -> ()
+                    | Some nm ->
+                      Hashtbl.add seen (bp, ep) ();
+                      if not !firstr then Buffer.add_char buf ',';
+                      firstr := false;
+                      Buffer.add_string buf
+                        (Printf.sprintf "[%d,%d,\"%s\"]" bp ep (esc nm))
                   end
                 | None -> ()) (Constrintern.take_ref_resolutions ())
-            with _ -> ());
+            with e ->
+              Printf.eprintf "rocq2lean: ref_resolutions key FAILED: %s\n"
+                (Printexc.to_string e));
            (* rocq2lean: RESOLVED types of SOURCE binders, keyed by source span.
               For an UNTYPED binder (`Definition valid_binary x := …`), Coq infers
               `x : spec_float` during pretyping; recorded by span so the translator
               fills the binder by its OWN loc — no telescope alignment. Source:
               `Constrintern.take_binder_types` (populated in `comDefinition`). *)
-           Buffer.add_string buf "],\"binder_types\":[";
+           Buffer.add_string buf
+             (Printf.sprintf "],\"ref_resolutions_skipped\":%d,\"binder_types\":["
+                !ref_res_skipped);
            (try
               let seenb = Hashtbl.create 997 in
               let firstb = ref true in
@@ -1417,6 +1452,88 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                   with _ -> ()
                 end) env ()
             with _ -> ());
+           (* rocq2lean: which of this unit's inductive blocks are COINDUCTIVE, and
+              whether each is RECURSIVE.
+
+              `declaration_order` tags every inductive block `"ind"` and
+              `detyped_inductives` carries no finiteness field, so a `CoInductive`
+              reached the translator indistinguishable from an `Inductive` and was
+              emitted as a Lean `inductive` -- a SILENT semantics change (Lean's
+              `inductive` is the LEAST fixpoint: Coq's inhabited `stream A` becomes a
+              provably EMPTY Lean type). Nothing downstream could detect the loss.
+
+              Shape: `[["<kername>", 0|1], ...]`, the flag being 1 when the block is
+              RECURSIVE. Both facts are needed, because they get different treatments:
+              a recursive coinductive has no Lean rendering and must be REFUSED, while
+              a NON-recursive one (`CoInductive apply_subrelation : Prop :=
+              do_subrelation.`) is a constant functor, whose least and greatest
+              fixpoints coincide -- so the Lean `inductive` is exactly right there and
+              refusing it would be a false gap.
+
+              Recursivity is decided on `Inductive.type_of_constructors`, i.e. the
+              constructor types with the block's inductives SUBSTITUTED IN. It cannot
+              be read off `mind_nf_lc`, where a self-reference is a de Bruijn `Rel`
+              into the arity context and no `Ind` node appears at all.
+
+              Each block is named BOTH ways its consumers key it: by the MutInd LABEL
+              (the `declaration_order` form, from `Global.r2l_structure_order`) and by
+              each packet's `mind_typename` (the `detyped_inductives` form). For a
+              single non-mutual inductive these coincide and only one row is emitted. *)
+           Buffer.add_string buf "],\"coinductives\":[";
+           (try
+              let env = Global.env () in
+              let this_mp = Names.ModPath.MPfile ldir in
+              let rec mp_root = function
+                | Names.ModPath.MPdot (mp, _) -> mp_root mp
+                | mp -> mp in
+              let mentions mind c =
+                let rec go c = match Constr.kind c with
+                  | Constr.Ind ((mi, _), _) when Names.MutInd.CanOrd.equal mi mind -> true
+                  | Constr.Construct (((mi, _), _), _) when Names.MutInd.CanOrd.equal mi mind -> true
+                  | _ -> Constr.fold (fun acc t -> acc || go t) false c in
+                go c in
+              let firstco = ref true in
+              let emit name rc =
+                if not !firstco then Buffer.add_char buf ',';
+                firstco := false;
+                Buffer.add_string buf
+                  (Printf.sprintf "[\"%s\",%d]" (esc name) (if rc then 1 else 0)) in
+              Environ.fold_inductives (fun mind mib () ->
+                if Names.ModPath.equal (mp_root (Names.MutInd.modpath mind)) this_mp
+                   && mib.Declarations.mind_finite = Declarations.CoFinite then begin
+                  let univ =
+                    match mib.Declarations.mind_universes with
+                    | Declarations.Polymorphic auctx -> UVars.make_abstract_instance auctx
+                    | _ -> UVars.Instance.empty in
+                  (* Fail CLOSED: if the constructor types cannot be recovered we must
+                     claim RECURSIVE, so the consumer refuses rather than silently
+                     emitting a least-fixpoint `inductive`. *)
+                  let rc =
+                    try
+                      (* Only the constructor's ARGUMENTS count. Its CONCLUSION is the
+                         inductive itself by construction (`do_marker : marker`), so
+                         testing the whole type calls EVERY coinductive recursive. *)
+                      let arg_mentions cty =
+                        let (ctx, _concl) = Term.decompose_prod_decls cty in
+                        List.exists (fun d ->
+                          mentions mind (Context.Rel.Declaration.get_type d)
+                          || (match Context.Rel.Declaration.get_value d with
+                              | Some b -> mentions mind b
+                              | None -> false)) ctx in
+                      Array.to_list mib.Declarations.mind_packets
+                      |> List.mapi (fun i oib -> (i, oib))
+                      |> List.exists (fun (i, oib) ->
+                           Array.exists arg_mentions
+                             (Inductive.type_of_constructors ((mind, i), univ) (mib, oib)))
+                    with _ -> true in
+                  let mp = Names.ModPath.to_string (Names.MutInd.modpath mind) in
+                  let lbl = mp ^ "." ^ Names.Label.to_string (Names.MutInd.label mind) in
+                  emit lbl rc;
+                  Array.iter (fun oib ->
+                    let tn = mp ^ "." ^ Names.Id.to_string oib.Declarations.mind_typename in
+                    if tn <> lbl then emit tn rc) mib.Declarations.mind_packets
+                end) env ()
+            with _ -> ());
            (* rocq2lean: constants/inductives in DECLARATION ORDER (see
               `Global.r2l_structure_order`). Every other key walks
               `Environ.fold_constants`, which yields the environment's map order, not
@@ -1424,16 +1541,24 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
               no source AST (an `Include`d inductive, an auto-generated scheme) BEFORE
               its users. The walk is rooted at this unit's own modpath, so unlike
               `resolved_types` it needs no prefix filter to keep a `Require`d unit out. *)
+           (* Row shape: ["const"|"ind", <kername>, <block index>, <block kername>].
+              The last two are meaningful only for `"ind"`: a MUTUAL inductive block
+              contributes ONE ROW PER MEMBER, all sharing `<block kername>` and
+              distinguished by `<block index>`, so the consumer can regroup them into
+              a single Lean `mutual … end`. A `"const"` row carries `0, ""`. *)
            Buffer.add_string buf "],\"declaration_order\":[";
            (try
               let firstd = ref true in
-              List.iter (fun (kind, name) ->
+              List.iter (fun (kind, name, bidx, bname) ->
                 if not !firstd then Buffer.add_char buf ',';
                 firstd := false;
                 Buffer.add_string buf
-                  (Printf.sprintf "[\"%s\",\"%s\"]" (esc kind) (esc name)))
+                  (Printf.sprintf "[\"%s\",\"%s\",%d,\"%s\"]"
+                     (esc kind) (esc name) bidx (esc bname)))
                 (Global.r2l_structure_order ())
-            with _ -> ());
+            with e ->
+              Printf.eprintf "rocq2lean: declaration_order key FAILED: %s\n"
+                (Printexc.to_string e));
            Buffer.add_string buf "]}";
            (* rocq2lean: explicit-cumulativity counters (R2L_TRACE_LIFT). *)
            if Option.has_some (Sys.getenv_opt "R2L_TRACE_LIFT") then
@@ -1441,7 +1566,14 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                meta_file !r2l_lifts !r2l_ups !r2l_downs !r2l_scruts !r2l_apps !r2l_fails;
            let oc = open_out meta_file in
            output_string oc (Buffer.contents buf); close_out oc
-         with _ -> ());
+         (* rocq2lean: LOUD. This is the outermost guard over the whole sidecar,
+            including the write itself — a swallowed failure here means NO
+            `.r2lmeta.json` at all, and the consumer's only symptom is a file that
+            translates to nothing. Never make it silent. *)
+         with e ->
+           Printf.eprintf "rocq2lean: METADATA SIDECAR ABORTED for %s: %s\n%!"
+             (safe_chop_extension long_f_dot_out ^ ".r2lmeta.json")
+             (Printexc.to_string e));
       Aux_file.record_in_aux_at "vo_compile_time"
         (Printf.sprintf "%.3f" (wall_clock2 -. wall_clock1));
       Aux_file.stop_aux_file ();
