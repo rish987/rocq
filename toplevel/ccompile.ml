@@ -547,6 +547,7 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
               let r2l_lifts = ref 0 and r2l_ups = ref 0 and r2l_fails = ref 0 in
               let r2l_downs = ref 0 in
               let r2l_scruts = ref 0 in
+              let r2l_projs = ref 0 in
               let r2l_apps = ref 0 in
               let r2l_explicitate env evd c0 =
                 let open EConstr in
@@ -580,6 +581,23 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
 
                      Kept below: the Case scrutinee ascription, unrelated, and still the
                      source of index terms. *)
+                  | Constr.Proj (pr, rel, arg) when not (Names.Projection.unfolded pr) ->
+                    (* PRIMITIVE PROJECTIONS. Rocq's detyper turns a kernel `Proj` into
+                       an APPLICATION OF THE PROJECTION CONSTANT (`noparams ()`), so the
+                       body Rocq gives the projection constant itself detypes to
+                       `fun t => find_duplicate_quotients t` -- a literal SELF-REFERENCE
+                       that cannot be translated, and nothing in the glob links the
+                       constant to the field it projects except its POSITION.
+                       Recovering the field by position is exactly what this codebase
+                       has been burned by, so recover it from Rocq instead: with the
+                       projection marked UNFOLDED and `Printing Unfolded Projection As
+                       Match` set (both done here), the detyper emits the faithful
+                       `match c with | Build_t _ x _ => x` and names the bound variable
+                       with the projection's REAL label (`Projection.label`). Same term,
+                       no self-reference, no positional inference. *)
+                    incr r2l_projs;
+                    mkProj (Names.Projection.unfold pr, rel,
+                            Termops.map_constr_with_full_binders env evd push_rel go env arg)
                   | Constr.App _ ->
                     Termops.map_constr_with_full_binders env evd push_rel go env c
                   | Constr.Case _ ->
@@ -721,6 +739,15 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                   Buffer.add_string buf
                     (Printf.sprintf "[\"%s\",%d]" (esc (Level.to_string u)) v)) g
             with _ -> ());
+           (* rocq2lean: make the detyper render an UNFOLDED primitive projection as a
+              `match` (see the `Proj` branch of `r2l_explicitate`). Off by default,
+              which is what left a projection constant's own body as a self-reference. *)
+           (try Goptions.set_bool_option_value
+                  ["Printing"; "Unfolded"; "Projection"; "As"; "Match"] true
+            with e ->
+              Printf.eprintf "rocq2lean: could not enable `Printing Unfolded Projection \
+As Match` -- primitive projections will detype as self-referential applications: \
+%s\n%!" (Printexc.to_string e));
            Buffer.add_string buf "],\"detyped_globs\":[";
            (try
               let env = Global.env () in
@@ -1145,7 +1172,19 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                        end
                      with _ -> ())
                 | None -> ()) (Constrintern.take_binder_type_globs ())
-            with _ -> ());
+            (* rocq2lean: LOUD, and SHAPE-PRESERVING. This one guard spans five keys,
+               and the `Buffer.add_string` calls that OPEN the last four live inside it
+               -- so a failure in the shared setup above (env / evd / the `jg`
+               serializer) used to skip those openers and make `detyped_type_globs`,
+               `detyped_inductives`, `interned_globs` and `binder_type_globs` VANISH
+               from the document, which stayed syntactically valid the whole time. The
+               consumer's only symptom was four silently-absent keys. Emit them empty
+               so the shape is preserved, and say what happened. *)
+            with e ->
+              Printf.eprintf "rocq2lean: detyped-glob keys ABORTED (the remaining four \
+are emitted EMPTY): %s\n%!" (Printexc.to_string e);
+              Buffer.add_string buf
+                "],\"detyped_type_globs\":[],\"detyped_inductives\":[],\"interned_globs\":[],\"binder_type_globs\":[");
            (* rocq2lean: SPAN-FREE ordered CONSTRUCTOR NAMES per referenced inductive.
               Every other ctor-naming key here is per-OCCURRENCE and SPAN-keyed
               (`ref_resolutions`), which is unusable for a DETYPED glob's
@@ -1452,6 +1491,60 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                   with _ -> ()
                 end) env ()
             with _ -> ());
+           (* rocq2lean: `Include`d / functor-instantiated declarations and their ORIGIN.
+
+              An `Include M` does not re-elaborate `M`'s contents: it splices them in by
+              module-level SUBSTITUTION, so `Stdlib.Arith.PeanoNat.Nat.iter` is a new
+              kername for the very constant `Corelib.Init.Nat.iter` names. Rocq keeps
+              both halves in the `KerPair` -- the USER name is where you wrote it, the
+              CANONICAL name is where it was defined -- and converts the two by delta,
+              which is why `Locate` says "syntactically equal to" and `reflexivity`
+              proves them equal.
+
+              The translator had no way to see this. Boot mode re-derives the included
+              copy from its body, so Lean gets TWO independent definitions with
+              identical bodies -- and for a structurally recursive one `isDefEq` cannot
+              unfold `Nat.rec` on a variable, so they are simply different types to
+              Lean. That is `PeanoNat.iter_rect`'s residual pair, and the
+              `Op_plus`/`Op_sub`/`Op_mul` family. With the origin in hand the consumer
+              can emit the copy as a TRANSPARENT ALIAS (`def iter := Corelib.Init.Nat.iter`)
+              and every reference converges on one definition again.
+
+              Emitted only where user <> canonical -- an ordinarily-declared constant has
+              them equal, so the key holds exactly this file's aliased declarations.
+              Rows: ["const"|"ind", "<user kername>", "<canonical kername>"], both in the
+              same dotted spelling `resolved_types` / `declaration_order` use. *)
+           Buffer.add_string buf "],\"constant_aliases\":[";
+           (try
+              let this_mp = Names.ModPath.MPfile ldir in
+              let rec mp_root = function
+                | Names.ModPath.MPdot (mp, _) -> mp_root mp
+                | mp -> mp in
+              let firsta = ref true in
+              let emit kind u c =
+                (* KerName equality on the STRINGS, not `KerName.equal`: we compare what
+                   the consumer will see, so a pair that prints the same is never
+                   reported as an alias. *)
+                let us = Names.KerName.to_string u in
+                let cs = Names.KerName.to_string c in
+                if us <> cs then begin
+                  if not !firsta then Buffer.add_char buf ',';
+                  firsta := false;
+                  Buffer.add_string buf
+                    (Printf.sprintf "[\"%s\",\"%s\",\"%s\"]" kind (esc us) (esc cs))
+                end in
+              let env = Global.env () in
+              Environ.fold_constants (fun c _ () ->
+                if Names.ModPath.equal (mp_root (Names.Constant.modpath c)) this_mp then
+                  emit "const" (Names.Constant.user c) (Names.Constant.canonical c))
+                env ();
+              Environ.fold_inductives (fun mind _ () ->
+                if Names.ModPath.equal (mp_root (Names.MutInd.modpath mind)) this_mp then
+                  emit "ind" (Names.MutInd.user mind) (Names.MutInd.canonical mind))
+                env ()
+            with e ->
+              Printf.eprintf "rocq2lean: constant_aliases key FAILED: %s\n%!"
+                (Printexc.to_string e));
            (* rocq2lean: which of this unit's inductive blocks are COINDUCTIVE, and
               whether each is RECURSIVE.
 
@@ -1533,7 +1626,17 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                     let tn = mp ^ "." ^ Names.Id.to_string oib.Declarations.mind_typename in
                     if tn <> lbl then emit tn rc) mib.Declarations.mind_packets
                 end) env ()
-            with _ -> ());
+            (* rocq2lean: LOUD. A truncated `coinductives` array makes a recursive
+               `CoInductive` indistinguishable from an `Inductive`, so the consumer
+               emits Lean's LEAST fixpoint where Rocq means the greatest -- a different
+               type (Rocq's inhabited `stream A` becomes provably EMPTY) that still
+               elaborates. Refusing is this key's whole purpose, so its failure can
+               never be silent. The per-block recursivity test already fails CLOSED
+               (`with _ -> true`); this is the array-level counterpart. *)
+            with e ->
+              Printf.eprintf "rocq2lean: coinductives key FAILED -- a recursive \
+CoInductive in this file may be emitted as a Lean `inductive`: %s\n%!"
+                (Printexc.to_string e));
            (* rocq2lean: constants/inductives in DECLARATION ORDER (see
               `Global.r2l_structure_order`). Every other key walks
               `Environ.fold_constants`, which yields the environment's map order, not
@@ -1562,8 +1665,8 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
            Buffer.add_string buf "]}";
            (* rocq2lean: explicit-cumulativity counters (R2L_TRACE_LIFT). *)
            if Option.has_some (Sys.getenv_opt "R2L_TRACE_LIFT") then
-             Printf.eprintf "[R2L-LIFT] %s: lifts=%d ups=%d downs=%d scruts=%d apps=%d retype_fail=%d\n%!"
-               meta_file !r2l_lifts !r2l_ups !r2l_downs !r2l_scruts !r2l_apps !r2l_fails;
+             Printf.eprintf "[R2L-LIFT] %s: lifts=%d ups=%d downs=%d scruts=%d apps=%d projs=%d retype_fail=%d\n%!"
+               meta_file !r2l_lifts !r2l_ups !r2l_downs !r2l_scruts !r2l_apps !r2l_projs !r2l_fails;
            let oc = open_out meta_file in
            output_string oc (Buffer.contents buf); close_out oc
          (* rocq2lean: LOUD. This is the outermost guard over the whole sidecar,
