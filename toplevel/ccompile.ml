@@ -1637,6 +1637,122 @@ are emitted EMPTY): %s\n%!" (Printexc.to_string e);
               Printf.eprintf "rocq2lean: coinductives key FAILED -- a recursive \
 CoInductive in this file may be emitted as a Lean `inductive`: %s\n%!"
                 (Printexc.to_string e));
+           (* rocq2lean: ROCQ'S OWN RENDERING of every coinductive block in this file,
+              printed by the kernel's own printer (`Printmod.pr_mutual_inductive_body`,
+              i.e. exactly what `Print <T>` shows).
+
+              WHY IT IS IN THE SIDECAR AT ALL. A recursive `CoInductive` has no Lean
+              declaration form, so the consumer AXIOMATIZES it (the type, its
+              constructors, a non-recursive dependent `casesOn`, its iota rules). Those
+              axioms say nothing about what they replaced, and the downstream
+              proof-filling AI has to reconstruct exactly that. The consumer emits this
+              string as a comment in front of the block.
+
+              It comes from the ENVIRONMENT, not from the `.v` file: rocq2lean does not
+              parse surface syntax and must not start
+              (`docs/investigations/surface-syntax-audit.md`). Reading the kernel and
+              printing it is not a surface-syntax dependency.
+
+              ADDITIVE KEY, on purpose: extending `coinductives`' row from 2 to 3
+              elements would have broken its exact-arity Lean decoder, and THAT decoder
+              is what decides whether a coinductive is recognised at all -- a miss there
+              emits Lean's least fixpoint for Rocq's greatest, silently. A new key cannot
+              do that: an old sidecar simply yields no comment.
+
+              Keyed BOTH ways its consumer can spell a block, exactly as `coinductives`
+              is: by the MutInd LABEL and by each packet's `mind_typename`. *)
+           Buffer.add_string buf "],\"coinductive_sources\":[";
+           (try
+              let env = Global.env () in
+              let this_mp = Names.ModPath.MPfile ldir in
+              let rec mp_root = function
+                | Names.ModPath.MPdot (mp, _) -> mp_root mp
+                | mp -> mp in
+              let firstcs = ref true in
+              let emit name txt =
+                if not !firstcs then Buffer.add_char buf ',';
+                firstcs := false;
+                Buffer.add_string buf
+                  (Printf.sprintf "[\"%s\",\"%s\"]" (esc name) (esc txt)) in
+              Environ.fold_inductives (fun mind mib () ->
+                if Names.ModPath.equal (mp_root (Names.MutInd.modpath mind)) this_mp
+                   && mib.Declarations.mind_finite = Declarations.CoFinite then begin
+                  (* LOUD per block: a printer failure here loses the comment for THIS
+                     coinductive only, and a silent loss is indistinguishable from
+                     "this file has no coinductive". No bare `with _ -> ()`. *)
+                  match
+                    (try Some (Pp.string_of_ppcmds
+                                 (Printmod.pr_mutual_inductive_body env mind mib None))
+                     with e ->
+                       Printf.eprintf "rocq2lean: coinductive_sources: could not PRINT \
+%s -- its axiomatization will carry no comment showing what it replaced: %s\n%!"
+                         (Names.MutInd.to_string mind) (Printexc.to_string e);
+                       None)
+                  with
+                  | None -> ()
+                  | Some txt ->
+                    let mp = Names.ModPath.to_string (Names.MutInd.modpath mind) in
+                    let lbl = mp ^ "." ^ Names.Label.to_string (Names.MutInd.label mind) in
+                    emit lbl txt;
+                    Array.iter (fun oib ->
+                      let tn = mp ^ "." ^ Names.Id.to_string oib.Declarations.mind_typename in
+                      if tn <> lbl then emit tn txt) mib.Declarations.mind_packets
+                end) env ()
+            with e ->
+              Printf.eprintf "rocq2lean: coinductive_sources key FAILED -- every \
+axiomatized CoInductive in this file will carry no comment showing what it replaced: \
+%s\n%!" (Printexc.to_string e));
+           (* rocq2lean: ROCQ'S OWN RENDERING of every `CoFixpoint` in this file, for the
+              same reason and the same consumer. Lean has no `cofix` term, so a
+              `CoFixpoint` is emitted with its true TYPE and an unproven body -- a
+              handoff, not a translation -- and nothing in the output says what the body
+              was.
+
+              This is the POST-ELABORATION body (the kernel `cofix` term), which is what
+              the environment holds; it is not the surface syntax and the consumer's
+              comment says so. Detected by a `CoFix` node in the body, so it needs no
+              vernac-level flag. *)
+           Buffer.add_string buf "],\"cofixpoint_sources\":[";
+           (try
+              let env = Global.env () in
+              let sigma = Evd.from_env env in
+              let this_mp = Names.ModPath.MPfile ldir in
+              let rec mp_root = function
+                | Names.ModPath.MPdot (mp, _) -> mp_root mp
+                | mp -> mp in
+              let rec has_cofix c = match Constr.kind c with
+                | Constr.CoFix _ -> true
+                | _ -> Constr.fold (fun acc t -> acc || has_cofix t) false c in
+              let firstcf = ref true in
+              Environ.fold_constants (fun cst cb () ->
+                if Names.ModPath.equal (mp_root (Names.Constant.modpath cst)) this_mp then
+                  match cb.Declarations.const_body with
+                  | Declarations.Def c when has_cofix c ->
+                    (match
+                       (try
+                          Some (Printf.sprintf "CoFixpoint %s : %s :=\n%s"
+                                  (Names.Label.to_string (Names.Constant.label cst))
+                                  (Pp.string_of_ppcmds
+                                     (Printer.pr_constr_env env sigma cb.Declarations.const_type))
+                                  (Pp.string_of_ppcmds (Printer.pr_constr_env env sigma c)))
+                        with e ->
+                          Printf.eprintf "rocq2lean: cofixpoint_sources: could not PRINT \
+%s -- its stub will carry no comment showing what its body was: %s\n%!"
+                            (Names.Constant.to_string cst) (Printexc.to_string e);
+                          None)
+                     with
+                     | None -> ()
+                     | Some txt ->
+                       if not !firstcf then Buffer.add_char buf ',';
+                       firstcf := false;
+                       Buffer.add_string buf
+                         (Printf.sprintf "[\"%s\",\"%s\"]"
+                            (esc (Names.Constant.to_string cst)) (esc txt)))
+                  | _ -> ()) env ()
+            with e ->
+              Printf.eprintf "rocq2lean: cofixpoint_sources key FAILED -- every \
+CoFixpoint stub in this file will carry no comment showing what its body was: %s\n%!"
+                (Printexc.to_string e));
            (* rocq2lean: constants/inductives in DECLARATION ORDER (see
               `Global.r2l_structure_order`). Every other key walks
               `Environ.fold_constants`, which yields the environment's map order, not
