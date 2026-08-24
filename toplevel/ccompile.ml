@@ -1171,20 +1171,105 @@ As Match` -- primitive projections will detype as self-referential applications:
                          Buffer.add_string buf (Printf.sprintf "[%d,%d,%s]" bp ep j)
                        end
                      with _ -> ())
-                | None -> ()) (Constrintern.take_binder_type_globs ())
-            (* rocq2lean: LOUD, and SHAPE-PRESERVING. This one guard spans five keys,
-               and the `Buffer.add_string` calls that OPEN the last four live inside it
+                | None -> ()) (Constrintern.take_binder_type_globs ());
+              (* rocq2lean: per-CONSTRUCTOR FIELD TELESCOPES, for every inductive this
+                 file REFERENCES but does not itself define. `detyped_inductives`
+                 (above) gives this for a file's OWN declarations; a wrapper declared
+                 elsewhere (`And` from Corelib, seen from CompCert's `Smallstep.v`) has
+                 none there, and the only other route to its constructor's field types
+                 was introspecting the ALREADY-ELABORATED Lean declaration via a live
+                 extraction environment (`[settings] incremental_elaboration`), which
+                 most fixtures do not turn on. This closes that gap the same way
+                 `referenced_nparams`/`inductive_ctor_names` already do: read it off
+                 Coq's OWN loaded environment instead. Lives HERE (inside this shared
+                 `jg`/`env`/`evd` scope), not alongside its `r2l_minds` siblings below,
+                 because it is the only one of them that needs to DETYPE anything —
+                 `jg` is local to this `try`.
+
+                 Same per-row computation as `detyped_inductives`'s ctor half (full
+                 ctor type, PARAMS-then-FIELDS as leading ∀-binders, its own universe
+                 instance) — just pointed at `r2l_minds` (referenced, not
+                 declared-here) and keyed the SAME RAW way `referenced_nparams` /
+                 `inductive_ctor_names` / `referenced_sorts` are: `<globKey>#<blockIdx>`,
+                 globIds order (innermost-first), UN-REVERSED. That is deliberate, not
+                 an oversight: this key's one consumer (`nestFieldPlan?`'s sidecar
+                 fallback) already holds the wrapper's `GRef`/`IndRef` glob NODE at the
+                 use site (`headJ` in `globWrapperApp?`) and derives the same raw
+                 string straight from it (`globRefSortKey?`'s computation) — no
+                 Lean-name reconstruction, so no boundary to guess and no
+                 `sidecarKeySpellings` needed for THIS particular lookup (unlike
+                 `referenced_nparams`, whose consumer instead starts from an
+                 already-elaborated Lean name and must guess the DirPath/module-label
+                 boundary back).
+
+                 Entry: [<globKey>#<blockIdx>, <nparams>, [["<ctor>",<ctorTyGlob>],…]].
+                 Nparams is carried IN the row (not just cross-referenced against
+                 `referenced_nparams`) so this key answers on its own — the fork rule
+                 of one key failing closed independent of any other.
+
+                 LOUD, not a bare `try…with _ -> ()`: a swallowed failure here would
+                 leave `nestFieldPlan?`'s sidecar fallback silently unable to find a
+                 wrapper's field structure, which is exactly the bug this key exists
+                 to fix — so a lookup or detyping failure for one inductive is
+                 reported to stderr and skips only THAT entry, not the whole key. *)
+              Buffer.add_string buf "],\"referenced_ctor_types\":[";
+              let firstrct = ref true in
+              Hashtbl.iter (fun key mi ->
+                match (try Some (Environ.lookup_mind mi env) with e ->
+                         Printf.eprintf
+                           "rocq2lean: referenced_ctor_types: lookup_mind %s failed: %s\n"
+                           key (Printexc.to_string e); None) with
+                | None -> ()
+                | Some mib ->
+                  let univ =
+                    match mib.Declarations.mind_universes with
+                    | Declarations.Polymorphic auctx -> UVars.make_abstract_instance auctx
+                    | _ -> UVars.Instance.empty in
+                  Array.iteri (fun i oib ->
+                    match
+                      (try
+                         let ctor_tys =
+                           Inductive.type_of_constructors ((mi, i), univ) (mib, oib) in
+                         let dj t =
+                           jg (Flags.with_options [Flags.raw_print; Detyping.print_universes]
+                                 (Detyping.detype Detyping.Now env evd)
+                                 (r2l_explicitate env evd (EConstr.of_constr t))) in
+                         let ctors_j = String.concat "," (Array.to_list (Array.mapi
+                           (fun j cty ->
+                              Printf.sprintf "[\"%s\",%s]"
+                                (esc (Names.Id.to_string
+                                        oib.Declarations.mind_consnames.(j)))
+                                (dj cty))
+                           ctor_tys)) in
+                         Some ctors_j
+                       with e ->
+                         Printf.eprintf
+                           "rocq2lean: referenced_ctor_types: %s#%d ctor detyping \
+failed: %s\n" key i (Printexc.to_string e);
+                         None)
+                    with
+                    | None -> ()
+                    | Some ctors_j ->
+                      if not !firstrct then Buffer.add_char buf ',';
+                      firstrct := false;
+                      Buffer.add_string buf
+                        (Printf.sprintf "[\"%s#%d\",%d,[%s]]"
+                           (esc key) i mib.Declarations.mind_nparams ctors_j))
+                    mib.Declarations.mind_packets) r2l_minds
+            (* rocq2lean: LOUD, and SHAPE-PRESERVING. This one guard spans SIX keys,
+               and the `Buffer.add_string` calls that OPEN the last five live inside it
                -- so a failure in the shared setup above (env / evd / the `jg`
                serializer) used to skip those openers and make `detyped_type_globs`,
-               `detyped_inductives`, `interned_globs` and `binder_type_globs` VANISH
-               from the document, which stayed syntactically valid the whole time. The
-               consumer's only symptom was four silently-absent keys. Emit them empty
-               so the shape is preserved, and say what happened. *)
+               `detyped_inductives`, `interned_globs`, `binder_type_globs` and
+               `referenced_ctor_types` VANISH from the document, which stayed
+               syntactically valid the whole time. The consumer's only symptom was
+               five silently-absent keys. Emit them empty so the shape is preserved,
+               and say what happened. *)
             with e ->
-              Printf.eprintf "rocq2lean: detyped-glob keys ABORTED (the remaining four \
+              Printf.eprintf "rocq2lean: detyped-glob keys ABORTED (the remaining five \
 are emitted EMPTY): %s\n%!" (Printexc.to_string e);
               Buffer.add_string buf
-                "],\"detyped_type_globs\":[],\"detyped_inductives\":[],\"interned_globs\":[],\"binder_type_globs\":[");
+                "],\"detyped_type_globs\":[],\"detyped_inductives\":[],\"interned_globs\":[],\"binder_type_globs\":[],\"referenced_ctor_types\":[");
            (* rocq2lean: SPAN-FREE ordered CONSTRUCTOR NAMES per referenced inductive.
               Every other ctor-naming key here is per-OCCURRENCE and SPAN-keyed
               (`ref_resolutions`), which is unusable for a DETYPED glob's
