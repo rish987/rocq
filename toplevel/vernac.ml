@@ -70,7 +70,120 @@ let emit_time state com tstart tend =
     | ToFeedback -> Feedback.msg_notice pp
     | ToChannel ch -> Pp.pp_with ch (pp ++ fnl())
 
+(* rocq2lean: per-declaration SOURCE TEXT spans (byte offsets into the .v file
+   being compiled), for the `.r2lmeta.json` `declaration_sources` key. The
+   downstream consumer (rocq2lean) annotates every emitted Lean declaration with a
+   comment quoting its ORIGINAL Rocq source, including the tactic proof -- which
+   exists nowhere else: a `Qed`-opaque theorem has no kernel body to print, unlike
+   `coinductive_sources`/`cofixpoint_sources` (which print the ENVIRONMENT, not
+   the source text, and only for those two decl shapes).
+
+   PURELY SYNTACTIC, no kernel/env access needed: a `Theorem`/`Instance`/… vernac
+   and its CLOSING `Qed`/`Defined`/`Admitted` are two SEPARATE vernac_control
+   commands (the tactic lines between them are more commands still), so this pairs
+   the OPENING command's start position with the CLOSING command's end position
+   across this loop. `r2l_open_proof` tracks the one pending pair; every branch
+   that could otherwise leave it stale (an `Abort`, or a self-contained
+   declaration seen while it is still set -- malformed input, or a `Program`
+   obligation this hook does not track) clears it FIRST, so a later `Qed` can
+   never attach to the WRONG declaration's start position -- the exact
+   "slice-bleed" failure mode the Lean-side discharge recovery hit once
+   (`d8cb94f`). Reset once per compilation by `r2l_reset_decl_spans`. *)
+let r2l_decl_spans : (string * int * int) list ref = ref []
+let r2l_open_proof : (string list * int) option ref = ref None
+
+let r2l_reset_decl_spans () =
+  r2l_decl_spans := [];
+  r2l_open_proof := None
+
+let r2l_take_decl_spans () =
+  let l = List.rev !r2l_decl_spans in
+  r2l_decl_spans := [];
+  l
+
+(* The name(s) a vernac_expr declares, and whether it OPENS an interactive proof
+   (its constant is added only when a LATER `Qed`/`Defined`/`Admitted` closes it)
+   or is SELF-CONTAINED (its own span is the whole answer). `None` for a vernac
+   this hook does not track -- every other command passes through untouched.
+   EVERY member of a mutual `with`-group/block is kept (`Fixpoint f … with g …`,
+   `Theorem f : … with g : …`, a mutual `Inductive`) — all sharing the ONE span
+   this whole vernac has, so a later member is not left with no comment at all. *)
+let r2l_decl_names_opens_proof (e : Vernacexpr.vernac_expr) : (string list * bool) option =
+  let open Vernacexpr in
+  let lname_id (l : Names.lname) = match l.CAst.v with
+    | Names.Name id -> Some (Names.Id.to_string id)
+    | Names.Anonymous -> None in
+  let lident_id (l : Names.lident) = Some (Names.Id.to_string l.CAst.v) in
+  let some_names ns opens = match List.filter_map (fun x -> x) ns with
+    | [] -> None
+    | ns -> Some (ns, opens) in
+  match e with
+  | VernacSynPure (VernacStartTheoremProof (_, ps)) ->
+    some_names (List.map (fun ((id, _), _) -> lident_id id) ps) true
+  | VernacSynPure (VernacInstance (name_decl, _, _, body, _)) ->
+    let (l, _) = name_decl in
+    Option.bind (lname_id l) (fun n -> Some ([n], (match body with None -> true | Some _ -> false)))
+  | VernacSynPure (VernacDeclareInstance ((id, _), _, _, _)) ->
+    Option.bind (lident_id id) (fun n -> Some ([n], true))
+  | VernacSynPure (VernacDefinition (_, name_decl, _)) ->
+    let (l, _) = name_decl in
+    Option.bind (lname_id l) (fun n -> Some ([n], false))
+  | VernacSynPure (VernacFixpoint (_, (_, rs))) ->
+    some_names (List.map (fun r -> lident_id r.fname) rs) false
+  | VernacSynPure (VernacCoFixpoint (_, rs)) ->
+    some_names (List.map (fun r -> lident_id r.fname) rs) false
+  | VernacSynPure (VernacInductive (_, blocks)) ->
+    some_names (List.map (fun ((((_, (l, _)), _, _, _), _)) -> lident_id l) blocks) false
+  | VernacSynPure (VernacAssumption (_, _, wc_list)) ->
+    (* `Axiom a b : T.` names several constants of ONE type in one vernac. *)
+    let names = List.concat (List.map (fun (_, (idl, _)) ->
+        List.map (fun (id, _) -> lident_id id) idl) wc_list) in
+    some_names names false
+  | _ -> None
+
+(* Recorded before `Stm.add`/`Stm.observe` even run: this is a SYNTACTIC
+   classification of `com`, independent of whether interpretation goes on to
+   succeed. On a `.vo`-building compile a failed interpretation aborts the whole
+   process before `ccompile.ml` ever reads `r2l_take_decl_spans`, so an
+   optimistically-recorded span from a command that then failed is simply never
+   read. LOUD on the rare internal-shape surprise (an unforeseen AST variant),
+   never silent: same discipline as every other `_sources` hook -- this key's
+   whole purpose is showing the downstream proof-filling AI what a `sorry`
+   replaced, and a swallowed exception here would drop that silently, file-wide. *)
+let r2l_note_vernac (com : Vernacexpr.vernac_control) =
+  let open Vernacexpr in
+  match com.CAst.loc with
+  | None -> ()
+  | Some loc ->
+    (try
+       match com.CAst.v.expr with
+       | VernacSynPure (VernacEndProof _) ->
+         (match !r2l_open_proof with
+          | Some (names, bp) ->
+            List.iter (fun name ->
+              r2l_decl_spans := (name, bp, loc.Loc.ep) :: !r2l_decl_spans) names;
+            r2l_open_proof := None
+          | None -> ())
+       | VernacSynPure VernacAbort | VernacSynPure VernacAbortAll ->
+         r2l_open_proof := None
+       | e ->
+         (match r2l_decl_names_opens_proof e with
+          | Some (names, true) -> r2l_open_proof := Some (names, loc.Loc.bp)
+          | Some (names, false) ->
+            (* A self-contained declaration seen while a proof is still marked
+               open is malformed input or an untracked `Program` obligation --
+               either way the stale start cannot belong to THIS name, so drop
+               it rather than let a later `Qed` attach it here. *)
+            r2l_open_proof := None;
+            List.iter (fun name ->
+              r2l_decl_spans := (name, loc.Loc.bp, loc.Loc.ep) :: !r2l_decl_spans) names
+          | None -> ())
+     with e ->
+       Printf.eprintf "rocq2lean: r2l_note_vernac FAILED -- this declaration's \
+source-text comment will be missing: %s\n%!" (Printexc.to_string e))
+
 let interp_vernac ~check ~state ({CAst.loc;_} as com) =
+  r2l_note_vernac com;
   let open State in
     try
       let doc, nsid, ntip = Stm.add ~doc:state.doc ~ontop:state.sid (not !Flags.quiet) com in

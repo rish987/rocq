@@ -65,6 +65,12 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
       let wall_clock1 = Unix.gettimeofday () in
       let check = Stm.AsyncOpts.(stm_options.async_proofs_mode = APoff) in
       let source = source ldir long_f_dot_in in
+      (* rocq2lean: clear any leftover per-declaration source-span state before
+         this compilation's own vernac loop runs (see `declaration_sources` below;
+         a leftover open-proof marker from an earlier compilation in the SAME
+         process would otherwise bleed its stale start position into this file's
+         first `Qed`). *)
+      Vernac.r2l_reset_decl_spans ();
       let state = Vernac.load_vernac ~echo ~check ~state ~source long_f_dot_in in
       let fullstate = Stm.finish ~doc:state.doc in
       ensure_no_pending_proofs ~filename:long_f_dot_in fullstate;
@@ -1862,6 +1868,44 @@ CoFixpoint stub in this file will carry no comment showing what its body was: %s
                 (Global.r2l_structure_order ())
             with e ->
               Printf.eprintf "rocq2lean: declaration_order key FAILED: %s\n"
+                (Printexc.to_string e));
+           (* rocq2lean: the RAW .v SOURCE TEXT for every top-level declaration this
+              file's vernac loop recognised (`Vernac.r2l_note_vernac`), spanning from
+              the declaring keyword through a `Qed`/`Defined`/`Admitted` when there is
+              one -- the tactic PROOF exists nowhere else once compiled: a
+              `Qed`-opaque theorem has no kernel body to print, unlike
+              `coinductive_sources`/`cofixpoint_sources` above (which print the
+              ENVIRONMENT, not source text, and only for those two decl shapes).
+              Row shape: `[name, source]`; `name` is the SHORT (unqualified)
+              identifier the vernac declared, matched the same way the consumer
+              already matches `coinductive_sources`/`cofixpoint_sources` by short
+              name -- positionally/in file order, so a repeated short name (two
+              `Section`s each defining `foo`) still pairs up in encounter order
+              rather than colliding. *)
+           Buffer.add_string buf "],\"declaration_sources\":[";
+           (try
+              let spans = Vernac.r2l_take_decl_spans () in
+              if spans <> [] then begin
+                let ic = open_in_bin long_f_dot_in in
+                let len = in_channel_length ic in
+                let src = really_input_string ic len in
+                close_in ic;
+                let firsts = ref true in
+                List.iter (fun (name, bp, ep) ->
+                  if bp >= 0 && ep <= len && bp <= ep then begin
+                    if not !firsts then Buffer.add_char buf ',';
+                    firsts := false;
+                    Buffer.add_string buf
+                      (Printf.sprintf "[\"%s\",\"%s\"]"
+                         (esc name) (esc (String.sub src bp (ep - bp))))
+                  end else
+                    Printf.eprintf "rocq2lean: declaration_sources: span for %s out \
+of range (bp=%d ep=%d len=%d) -- skipped\n%!" name bp ep len)
+                  spans
+              end
+            with e ->
+              Printf.eprintf "rocq2lean: declaration_sources key FAILED -- every \
+declaration in this file will carry no ORIGINAL-SOURCE comment: %s\n%!"
                 (Printexc.to_string e));
            Buffer.add_string buf "]}";
            (* rocq2lean: explicit-cumulativity counters (R2L_TRACE_LIFT). *)

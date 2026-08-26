@@ -35,3 +35,12 @@ val process_expr : state:State.t -> Vernacexpr.vernac_control -> State.t
     and print errors in form of exceptions. *)
 val load_vernac : echo:bool -> check:bool ->
   state:State.t -> ?source:Loc.source -> string -> State.t
+
+(* rocq2lean: per-declaration SOURCE TEXT spans (byte offsets into the .v file
+   being compiled), for the `.r2lmeta.json` `declaration_sources` key -- see the
+   long comment above `r2l_note_vernac` in vernac.ml. Each entry is
+   `(name, bp, ep)`: `name` is the short (unqualified) identifier the vernac
+   declares; `bp`/`ep` are BYTE offsets, inclusive of a `Theorem`'s tactic proof
+   through its closing `Qed`/`Defined`/`Admitted`. *)
+val r2l_reset_decl_spans : unit -> unit
+val r2l_take_decl_spans : unit -> (string * int * int) list
