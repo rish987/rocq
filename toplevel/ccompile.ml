@@ -745,6 +745,58 @@ let compile opts stm_options injections copts ~echo ~f_in ~f_out =
                   Buffer.add_string buf
                     (Printf.sprintf "[\"%s\",%d]" (esc (Level.to_string u)) v)) g
             with _ -> ());
+           (* rocq2lean: MONOMORPHIC universe CONSTRAINT EDGES.
+
+              `universe_valuation` above emits the SOLUTION Coq's minimiser happened
+              to pick. From a valuation alone you cannot tell "Coq PROVED these two
+              levels related" from "they independently came out at the same number",
+              so a consumer that wants to keep a level as general as Coq did has
+              nothing to go on. The edges are that missing evidence.
+
+              Read from the SAME global graph as the valuation
+              (`UGraph.repr (Global.universes ())`) and filtered to the edges with at
+              least ONE endpoint among THIS file's own levels (a `Level.name` whose
+              DirPath is `ldir`). Without that filter the key is the entire global
+              graph -- thousands of edges, almost all of them about other files. A
+              cross-file edge (the other endpoint a `Corelib.…` level, or `Set`) is
+              KEPT and named in full, since that is exactly the interesting case.
+
+              `UGraph.node` distinguishes three things and all three are emitted as
+              themselves:
+                `Node ltle` -- ltle maps v to `true` for `u < v`, `false` for `u <= v`
+                `Alias v`   -- u and v are the SAME graph node, i.e. `u = v`
+              `<=` is a strictly weaker claim than `=`; collapsing them would
+              reintroduce precisely the guess this key exists to remove.
+
+              Entry: ["<level>", "<" | "<=" | "=", "<level>"], read left-to-right --
+              the LEFT level is the lower one. *)
+           Buffer.add_string buf "],\"mono_constraints\":[";
+           let firstmc = ref true in
+           (try
+              let g = UGraph.repr (Global.universes ()) in
+              let open Univ in
+              let is_local l = match Level.name l with
+                | Some ug ->
+                  let dp, _, _ = UGlobal.repr ug in
+                  Names.DirPath.equal dp ldir
+                | None -> false in
+              let emit u d v =
+                if is_local u || is_local v then begin
+                  if not !firstmc then Buffer.add_char buf ',';
+                  firstmc := false;
+                  Buffer.add_string buf
+                    (Printf.sprintf "[\"%s\",\"%s\",\"%s\"]"
+                       (esc (Level.to_string u)) d (esc (Level.to_string v)))
+                end in
+              Level.Map.iter (fun u node -> match node with
+                  | UGraph.Alias v -> emit u "=" v
+                  | UGraph.Node ltle ->
+                    Level.Map.iter
+                      (fun v lt -> emit u (if lt then "<" else "<=") v) ltle) g
+            with e ->
+              Printf.eprintf "rocq2lean: mono_constraints key FAILED -- the consumer \
+sees the universe VALUATION with no evidence of which levels Coq actually related, \
+and will pin levels Coq would have widened: %s\n%!" (Printexc.to_string e));
            (* rocq2lean: make the detyper render an UNFOLDED primitive projection as a
               `match` (see the `Proj` branch of `r2l_explicitate`). Off by default,
               which is what left a projection constant's own body as a self-reference. *)
