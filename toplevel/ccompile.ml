@@ -806,6 +806,437 @@ and will pin levels Coq would have widened: %s\n%!" (Printexc.to_string e));
               Printf.eprintf "rocq2lean: could not enable `Printing Unfolded Projection \
 As Match` -- primitive projections will detype as self-referential applications: \
 %s\n%!" (Printexc.to_string e));
+           (* rocq2lean: CUMULATIVITY SITES -- the places where Rocq's kernel
+              actually USED subtyping, i.e. accepted `Type@{i} <= Type@{j}` (or
+              `Prop`/`Set` <= `Type`) with the two sorts NOT equal, rather than
+              requiring equality. Lean has no cumulativity at all, so each of these
+              is a position the translation can break; today they are found only
+              BACKWARDS, from a Lean elaboration error, and an error says where it
+              BROKE, not where the coercion HAPPENED.
+
+              RECORD ONLY. An earlier fork pass (dc25002 -> 000f386, RETIRED at
+              cf2930a) INSERTED explicit lifts at exactly these positions and
+              cascaded through whole telescopes. Nothing here rewrites a term: the
+              traversal below is a pure observer.
+
+              We deliberately do NOT hook `kernel/conversion.ml`. Its CUMUL path is
+              memoized, short-circuits when the two sides converge syntactically,
+              and is called speculatively with backtracking -- a hook there yields a
+              list that is at once INCOMPLETE (a memo hit skips the comparison) and
+              FALSE-POSITIVE (a backtracked attempt logged as a real use). Instead a
+              type-directed traversal REPLAYS the kernel's own CUMUL sites
+              (`Typeops.type_of_apply` at typeops.ml:243, `type_of_parameters` at
+              :269, `check_branch_types` at :453, the Fix body check at :583, the
+              LetIn body check at :911, and each declaration's body-vs-declared-type
+              check) and asks TWO questions per site, in this order:
+
+              NOT covered, so the key UNDER-reports rather than over-reports: the
+              `CaseInvert` scrutinee check (:735) and `check_context` on section
+              contexts. `not_leq` in the stderr summary is the other coverage
+              signal -- it counts sites where our reconstruction of the expected
+              type failed to match the kernel's, and is 0 on all 60 VST modules
+              measured.
+
+                `Conversion.conv`     (CONV)  -- if the actual and expected types are
+                                                already CONVERTIBLE AS EQUALS then
+                                                cumulativity was NOT used and nothing
+                                                is recorded. This is the test that
+                                                keeps the key from crying wolf on an
+                                                equality that merely travelled the
+                                                same kernel code path.
+                `Conversion.conv_leq` (CUMUL) -- if only this one succeeds, the
+                                                kernel DID use subtyping here.
+
+              The responsible universes are then located by a parallel walk of the
+              two types which yields every pair of sorts that are unequal under
+              `UGraph.check_eq_sort` but related by `check_leq_sort`. So every level
+              pair emitted is a STRICT use by construction, and the walk's PATH says
+              whether the strictness sits in a Pi domain, a Pi codomain, or an
+              inductive's universe instance.
+
+              The traversal is `Termops.map_constr_with_full_binders` used as an
+              ITERATOR (the mapped term is discarded). Hand-rolling the binder cases
+              is precisely what made the retired pass skip 1252 sites in `Init/Logic`
+              alone: a wrong env under `Case` branches and `Fix` made `Retyping`
+              throw and the enclosing application was abandoned.
+
+              Entry, 8 fields:
+                ["<decl>", "<region>", "<shape>", <argpos>, "<head>", "<path>",
+                 "<lower sort>", "<upper sort>"]
+                decl    full kername of the enclosing declaration (or
+                        `<modpath>.<indname>` for an inductive)
+                region  which part of it: "body" | "type" | "arity" | "ctor:<name>"
+                shape   the kernel site: app_arg | ind_param | ind_index |
+                        ctor_param | ctor_field | case_branch | letin | cast |
+                        fix_body | cofix_body | decl_body
+                argpos  0-based argument index, or -1 where there is none
+                head    the applied head (Const:/Ind:/Ctor:/Var:/Rel:/?) -- this is
+                        what makes the list RANKABLE by callee
+                path    where inside the two types the sorts differ: "" is the types
+                        themselves, then ".dom" (Pi domain, CONTRAVARIANT -- the
+                        expected type's domain is the lower one), ".cod" (Pi
+                        codomain), ".argN", ".univN" (universe instance slot N)
+                lower   the sort Rocq had
+                upper   the sort Rocq demanded
+
+              A site whose levels could not be located is emitted once with path
+              "?" and both sorts "?" rather than dropped, and counted; see the
+              stderr summary below. *)
+           Buffer.add_string buf "],\"cumulativity_sites\":[";
+           let firstcs = ref true in
+           let cs_emitted = ref 0 and cs_unlocated = ref 0 in
+           let cs_retype_fail = ref 0 and cs_scan_fail = ref 0 in
+           let cs_arity_fail = ref 0 and cs_conv_raised = ref 0 in
+           let cs_not_leq = ref 0 and cs_checks = ref 0 in
+           let cs_template = ref 0 in
+           let cs_t0 = Sys.time () in
+           (try
+              let genv = Global.env () in
+              let cs_evd = Evd.from_env genv in
+              let evd = cs_evd in
+              let this_mp = Names.ModPath.MPfile ldir in
+              let rec mp_root = function
+                | Names.ModPath.MPdot (mp, _) -> mp_root mp
+                | mp -> mp in
+              let sort_str s = Pp.string_of_ppcmds (Sorts.raw_pr s) in
+              let emit decl region shape argpos head path lo up =
+                incr cs_emitted;
+                if not !firstcs then Buffer.add_char buf ',';
+                firstcs := false;
+                Buffer.add_string buf
+                  (Printf.sprintf "[\"%s\",\"%s\",\"%s\",%d,\"%s\",\"%s\",\"%s\",\"%s\"]"
+                     (esc decl) (esc region) (esc shape) argpos (esc head)
+                     (esc path) (esc lo) (esc up)) in
+              (* Parallel walk of (actual, expected). Yields (path, lower, upper) for
+                 each position whose two sorts are related by <= but NOT by =. Both
+                 sides are weak-head normalised, since a cumulative step can hide
+                 behind a definition. Only ever reached once the site is already
+                 known to be a cumulative use, so its cost is paid on real hits. *)
+              let rec cs_diff env path a e acc =
+                if List.length acc > 24 then acc else
+                let a = Reductionops.whd_all env evd a in
+                let e = Reductionops.whd_all env evd e in
+                match EConstr.kind evd a, EConstr.kind evd e with
+                | Constr.Sort s1, Constr.Sort s2 ->
+                  let s1 = EConstr.ESorts.kind evd s1 in
+                  let s2 = EConstr.ESorts.kind evd s2 in
+                  let g = Environ.universes env in
+                  if UGraph.check_eq_sort g s1 s2 then acc
+                  else if UGraph.check_leq_sort g s1 s2 then (path, s1, s2) :: acc
+                  else acc
+                | Constr.Prod (na, a1, b1), Constr.Prod (_, a2, b2) ->
+                  (* CONTRAVARIANT in the domain: the EXPECTED type's domain is the
+                     lower one, so the pair is emitted in that order and the path is
+                     tagged ".dom" so a consumer does not read it backwards. *)
+                  let acc = cs_diff env (path ^ ".dom") a2 a1 acc in
+                  let env' =
+                    EConstr.push_rel
+                      (Context.Rel.Declaration.LocalAssum (na, a1)) env in
+                  cs_diff env' (path ^ ".cod") b1 b2 acc
+                | Constr.App (h1, ar1), Constr.App (h2, ar2)
+                  when Array.length ar1 = Array.length ar2 ->
+                  let acc = ref (cs_diff env (path ^ ".hd") h1 h2 acc) in
+                  Array.iteri (fun i x ->
+                      acc := cs_diff env (Printf.sprintf "%s.arg%d" path i)
+                               x ar2.(i) !acc) ar1;
+                  !acc
+                | Constr.Ind (i1, u1), Constr.Ind (i2, u2)
+                  when Names.Ind.CanOrd.equal i1 i2 ->
+                  cs_diff_instance env path (EConstr.EInstance.kind evd u1)
+                    (EConstr.EInstance.kind evd u2) acc
+                | Constr.Const (c1, u1), Constr.Const (c2, u2)
+                  when Names.Constant.CanOrd.equal c1 c2 ->
+                  cs_diff_instance env path (EConstr.EInstance.kind evd u1)
+                    (EConstr.EInstance.kind evd u2) acc
+                | _ -> acc
+              (* An inductive's or constant's UNIVERSE INSTANCE. Rocq's cumulative
+                 inductives compare instances with <=, so a strict step can live
+                 entirely here with no Sort node anywhere in either type. *)
+              and cs_diff_instance env path u1 u2 acc =
+                let (_, l1) = UVars.Instance.to_array u1 in
+                let (_, l2) = UVars.Instance.to_array u2 in
+                if Array.length l1 <> Array.length l2 then acc
+                else begin
+                  let g = Environ.universes env in
+                  let acc = ref acc in
+                  Array.iteri (fun i x ->
+                      let s1 = Sorts.sort_of_univ (Univ.Universe.make x) in
+                      let s2 = Sorts.sort_of_univ (Univ.Universe.make l2.(i)) in
+                      if not (UGraph.check_eq_sort g s1 s2)
+                      && UGraph.check_leq_sort g s1 s2 then
+                        acc := (Printf.sprintf "%s.univ%d" path i, s1, s2) :: !acc)
+                    l1;
+                  !acc
+                end in
+              (* ONE kernel CUMUL site. `actual` is what Rocq had, `expected` is what
+                 the position demanded. *)
+              let cs_check env decl region shape argpos head actual expected =
+                incr cs_checks;
+                if EConstr.eq_constr evd actual expected then () else
+                let a = EConstr.Unsafe.to_constr actual in
+                let e = EConstr.Unsafe.to_constr expected in
+                let conv_res =
+                  try `R (Conversion.conv env a e)
+                  with ex -> `Raised ex in
+                match conv_res with
+                | `R (Result.Ok ()) -> ()                    (* equal: not a use *)
+                | `Raised _ -> incr cs_conv_raised
+                | `R (Result.Error ()) ->
+                  let leq_res =
+                    try `R (Conversion.conv_leq env a e)
+                    with ex -> `Raised ex in
+                  (match leq_res with
+                   | `Raised _ -> incr cs_conv_raised
+                   | `R (Result.Error ()) ->
+                     (* Neither convertible nor a subtype: our reconstruction of the
+                        expected type does not match the kernel's (template
+                        polymorphism, an unfolded projection, ...). NOT a
+                        cumulativity site, and counted so the key's coverage is
+                        auditable rather than assumed. *)
+                     incr cs_not_leq;
+                     if Sys.getenv_opt "R2L_TRACE_CUM_NOTLEQ" <> None
+                        && !cs_not_leq <= 8 then
+                       Printf.eprintf "rocq2lean: cumulativity_sites NOT_LEQ #%d %s \
+%s/%s[%d] head=%s\n  actual   = %s\n  expected = %s\n%!" !cs_not_leq decl region
+                         shape argpos head
+                         (Pp.string_of_ppcmds (Constr.debug_print a))
+                         (Pp.string_of_ppcmds (Constr.debug_print e))
+                   | `R (Result.Ok ()) ->
+                     let sites =
+                       try cs_diff env "" actual expected []
+                       with ex ->
+                         Printf.eprintf "rocq2lean: cumulativity_sites could not \
+locate the levels of a CONFIRMED cumulative use in %s (%s/%s); it is emitted with \
+sort \"?\", so the site is counted but not attributable: %s\n%!"
+                           decl region shape (Printexc.to_string ex);
+                         [] in
+                     if sites = [] then begin
+                       incr cs_unlocated;
+                       emit decl region shape argpos head "?" "?" "?"
+                     end else
+                       List.iter (fun (p, s1, s2) ->
+                           emit decl region shape argpos head p
+                             (sort_str s1) (sort_str s2)) sites) in
+              (* APPLICATION: replay `Typeops.type_of_apply` -- walk the head's type
+                 as a telescope, checking each argument's own type against the
+                 domain it lands in, then substituting. Distinguishes an inductive's
+                 PARAMETERS from its INDICES and a constructor's parameters from its
+                 FIELDS, since those classes are fixable wholesale and an ordinary
+                 application argument is not. *)
+              let cs_app env decl region c =
+                match EConstr.kind evd c with
+                | Constr.App (f, args) ->
+                  let head, nparams, kind_of_head, is_template =
+                    match EConstr.kind evd f with
+                    | Constr.Const (kn, _) ->
+                      ("Const:" ^ Names.Constant.to_string kn, -1, `Other, false)
+                    | Constr.Ind (ind, _) ->
+                      let (mib, oib) = Inductive.lookup_mind_specif env ind in
+                      ("Ind:" ^ Names.ModPath.to_string (Names.MutInd.modpath (fst ind))
+                       ^ "." ^ Names.Id.to_string oib.Declarations.mind_typename,
+                       mib.Declarations.mind_nparams, `Ind,
+                       mib.Declarations.mind_template <> None)
+                    | Constr.Construct (((mind, i), j), _) ->
+                      let (mib, oib) = Inductive.lookup_mind_specif env (mind, i) in
+                      ("Ctor:" ^ Names.ModPath.to_string (Names.MutInd.modpath mind)
+                       ^ "." ^ Names.Id.to_string oib.Declarations.mind_typename
+                       ^ "." ^ Names.Id.to_string oib.Declarations.mind_consnames.(j-1),
+                       mib.Declarations.mind_nparams, `Ctor,
+                       mib.Declarations.mind_template <> None)
+                    | Constr.Var id -> ("Var:" ^ Names.Id.to_string id, -1, `Other, false)
+                    | Constr.Rel n -> (Printf.sprintf "Rel:%d" n, -1, `Other, false)
+                    | _ -> ("?", -1, `Other, false) in
+                  let shape_of i =
+                    match kind_of_head with
+                    | `Ind -> if i < nparams then "ind_param" else "ind_index"
+                    | `Ctor -> if i < nparams then "ctor_param" else "ctor_field"
+                    | `Other -> "app_arg" in
+                  (* TEMPLATE POLYMORPHISM. A template inductive's parameter types
+                     are NOT what its declaration says: the kernel SUBSTITUTES each
+                     template level with the sort of the argument actually supplied
+                     (`Typeops.make_param_univs` feeding
+                     `type_of_inductive_knowing_parameters`), so NO subtyping is
+                     required at those positions at all. Checking against the
+                     declared arity instead makes every `eq`/`prod`/`sigT`/`sig`/
+                     `option` application look like a cumulative use -- on
+                     `veric/compcert_rmaps` that alone accounted for most of the
+                     first run's 2273 rows, i.e. the key would have been mostly
+                     wolf. Ask Retyping for the arity KNOWING THE PARAMETERS, which
+                     is the pretyping-level spelling of what the kernel does. *)
+                  (match (try Some (if is_template then
+                                      Retyping.type_of_global_reference_knowing_parameters
+                                        env evd f args
+                                    else Retyping.get_type_of env evd f)
+                          with _ -> incr cs_retype_fail; None) with
+                   | None -> ()
+                   | Some fty0 ->
+                     if is_template then incr cs_template;
+                     let fty = ref fty0 in
+                     Array.iteri (fun i arg ->
+                         match EConstr.kind evd (Reductionops.whd_all env evd !fty) with
+                         | Constr.Prod (_, dom, cod) ->
+                           (match (try Some (Retyping.get_type_of env evd arg)
+                                   with _ -> incr cs_retype_fail; None) with
+                            | None -> ()
+                            | Some aty ->
+                              cs_check env decl region (shape_of i) i head aty dom);
+                           fty := EConstr.Vars.subst1 arg cod
+                         | _ -> incr cs_arity_fail) args)
+                | _ -> () in
+              (* The iterator. `map_constr_with_full_binders` maintains the env
+                 through EVERY binder form including Case branches and Fix; the
+                 mapped term it returns is thrown away. *)
+              let cs_scan env decl region c0 =
+                let rec go env c =
+                  (match EConstr.kind evd c with
+                   | Constr.App _ -> cs_app env decl region c
+                   | Constr.LetIn (_, b, t, _) ->
+                     (match (try Some (Retyping.get_type_of env evd b)
+                             with _ -> incr cs_retype_fail; None) with
+                      | None -> () | Some bt ->
+                        cs_check env decl region "letin" (-1) "" bt t)
+                   | Constr.Cast (x, _, t) ->
+                     (match (try Some (Retyping.get_type_of env evd x)
+                             with _ -> incr cs_retype_fail; None) with
+                      | None -> () | Some xt ->
+                        cs_check env decl region "cast" (-1) "" xt t)
+                   | Constr.Case (ci, u, pms, p, iv, scrut, brs) ->
+                     (* MATCH BRANCHES: `Typeops.check_branch_types` compares each
+                        branch's type against the motive instantiated at that
+                        constructor with `conv_leq`, so a dependent elimination whose
+                        motive lands in a HIGHER sort than a branch produces is a
+                        cumulative use with no Sort node visible in the source. Build
+                        the expected branch types the way the kernel does
+                        (`Inductive.build_branches_type` on the EXPANDED case, whose
+                        return clause is already the lambda over indices+scrutinee
+                        that function wants). *)
+                     (match (try
+                               let (_, (pret, _), _, _, ebrs) =
+                                 EConstr.expand_case env evd
+                                   (ci, u, pms, p, iv, scrut, brs) in
+                               let specif =
+                                 Inductive.lookup_mind_specif env ci.Constr.ci_ind in
+                               let ku = EConstr.EInstance.kind evd u in
+                               let kpms =
+                                 Array.to_list
+                                   (Array.map EConstr.Unsafe.to_constr pms) in
+                               let lbr =
+                                 Inductive.build_branches_type
+                                   (ci.Constr.ci_ind, ku) specif kpms
+                                   (EConstr.Unsafe.to_constr pret) in
+                               Some (ebrs, lbr)
+                             with _ -> incr cs_arity_fail; None) with
+                      | None -> ()
+                      | Some (ebrs, lbr) ->
+                        if Array.length ebrs = Array.length lbr then
+                          Array.iteri (fun i br ->
+                              match (try Some (Retyping.get_type_of env evd br)
+                                     with _ -> incr cs_retype_fail; None) with
+                              | None -> () | Some brt ->
+                                cs_check env decl region "case_branch" i
+                                  (Names.MutInd.to_string (fst ci.Constr.ci_ind))
+                                  brt (EConstr.of_constr lbr.(i))) ebrs
+                        else incr cs_arity_fail)
+                   | Constr.Fix (_, (nas, tys, bds))
+                   | Constr.CoFix (_, (nas, tys, bds)) ->
+                     let shape = (match EConstr.kind evd c with
+                         | Constr.Fix _ -> "fix_body" | _ -> "cofix_body") in
+                     let n = Array.length tys in
+                     let env' = EConstr.push_rec_types (nas, tys, bds) env in
+                     Array.iteri (fun i bd ->
+                         match (try Some (Retyping.get_type_of env' evd bd)
+                                with _ -> incr cs_retype_fail; None) with
+                         | None -> () | Some bt ->
+                           cs_check env' decl region shape i "" bt
+                             (EConstr.Vars.lift n tys.(i))) bds
+                   | _ -> ());
+                  ignore (Termops.map_constr_with_full_binders
+                            env evd EConstr.push_rel go env c);
+                  c in
+                try ignore (go env c0) with ex ->
+                  incr cs_scan_fail;
+                  Printf.eprintf "rocq2lean: cumulativity_sites traversal ABORTED in \
+%s (%s) -- every site in that declaration is MISSING from the key: %s\n%!"
+                    decl region (Printexc.to_string ex) in
+              (* A POLYMORPHIC declaration's own `Var i` levels are not in the global
+                 graph, so conversion cannot see them; push the abstract context or
+                 every check on such a declaration raises and is lost. *)
+              let cs_env_for = function
+                | Declarations.Polymorphic auctx ->
+                  Environ.push_context ~strict:false
+                    (UVars.AbstractContext.repr auctx) genv
+                | _ -> genv in
+              Environ.fold_constants (fun c cb () ->
+                  if Names.ModPath.equal
+                      (mp_root (Names.Constant.modpath c)) this_mp then begin
+                    let decl = Names.Constant.to_string c in
+                    let env = cs_env_for cb.Declarations.const_universes in
+                    (match cb.Declarations.const_body with
+                     | Declarations.Def body ->
+                       let body = EConstr.of_constr body in
+                       (* The declaration's OWN body-vs-declared-type CUMUL check.
+                          This is the site that a `Definition f@{u v | u < v} :
+                          Type@{u} -> Type@{v} := fun T => T` lands on: the body has
+                          type `Type@{u} -> Type@{u}`, the declared type demands
+                          `Type@{u} -> Type@{v}`, and only the codomain differs. *)
+                       (match (try Some (Retyping.get_type_of env evd body)
+                               with _ -> incr cs_retype_fail; None) with
+                        | None -> () | Some bt ->
+                          cs_check env decl "body" "decl_body" (-1) "" bt
+                            (EConstr.of_constr cb.Declarations.const_type));
+                       cs_scan env decl "body" body
+                     | _ -> ());
+                    cs_scan env decl "type"
+                      (EConstr.of_constr cb.Declarations.const_type)
+                  end) genv ();
+              Environ.fold_inductives (fun mind mib () ->
+                  if Names.ModPath.equal
+                      (mp_root (Names.MutInd.modpath mind)) this_mp then begin
+                    let env = cs_env_for mib.Declarations.mind_universes in
+                    let univ = match mib.Declarations.mind_universes with
+                      | Declarations.Polymorphic auctx ->
+                        UVars.make_abstract_instance auctx
+                      | _ -> UVars.Instance.empty in
+                    Array.iteri (fun i oib ->
+                        let base =
+                          Names.ModPath.to_string (Names.MutInd.modpath mind) ^ "."
+                          ^ Names.Id.to_string oib.Declarations.mind_typename in
+                        (match (try Some (Inductive.type_of_inductive ((mib, oib), univ))
+                                with _ -> incr cs_scan_fail; None) with
+                         | None -> () | Some t ->
+                           cs_scan env base "arity" (EConstr.of_constr t));
+                        (match (try Some (Inductive.type_of_constructors
+                                            ((mind, i), univ) (mib, oib))
+                                with _ -> incr cs_scan_fail; None) with
+                         | None -> () | Some ctys ->
+                           Array.iteri (fun j cty ->
+                               cs_scan env base
+                                 ("ctor:" ^ Names.Id.to_string
+                                    oib.Declarations.mind_consnames.(j))
+                                 (EConstr.of_constr cty)) ctys))
+                      mib.Declarations.mind_packets
+                  end) genv ();
+              if !cs_retype_fail > 0 || !cs_scan_fail > 0 || !cs_arity_fail > 0
+                 || !cs_conv_raised > 0 then
+                Printf.eprintf "rocq2lean: cumulativity_sites is INCOMPLETE for %s -- \
+%d site(s) emitted from %d checks, but retype_fail=%d scan_fail=%d arity_fail=%d \
+conv_raised=%d: a cumulative use in any of those positions is MISSING from the key, \
+so a consumer ranking cumulative uses UNDER-counts them (not_leq=%d unlocated=%d)\n%!"
+                  (Names.DirPath.to_string ldir) !cs_emitted !cs_checks
+                  !cs_retype_fail !cs_scan_fail !cs_arity_fail !cs_conv_raised
+                  !cs_not_leq !cs_unlocated;
+              (if Sys.getenv_opt "R2L_TRACE_CUM" <> None then
+                 Printf.eprintf "rocq2lean: cumulativity_sites %s: emitted=%d \
+checks=%d not_leq=%d unlocated=%d retype_fail=%d scan_fail=%d arity_fail=%d \
+conv_raised=%d template_heads=%d cpu=%.3fs\n%!" (Names.DirPath.to_string ldir)
+                   !cs_emitted !cs_checks !cs_not_leq !cs_unlocated !cs_retype_fail
+                   !cs_scan_fail !cs_arity_fail !cs_conv_raised !cs_template
+                   (Sys.time () -. cs_t0))
+            with e ->
+              Printf.eprintf "rocq2lean: cumulativity_sites key FAILED -- the consumer \
+gets an EMPTY list and will read that as \"Rocq used no cumulativity here\", which is \
+the one wrong conclusion this key exists to prevent: %s\n%!"
+                (Printexc.to_string e));
            Buffer.add_string buf "],\"detyped_globs\":[";
            (try
               let env = Global.env () in
