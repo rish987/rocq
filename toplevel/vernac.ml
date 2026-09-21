@@ -92,14 +92,93 @@ let emit_time state com tstart tend =
 let r2l_decl_spans : (string * int * int) list ref = ref []
 let r2l_open_proof : (string list * int) option ref = ref None
 
+(* rocq2lean: the COPY twin of `r2l_decl_spans`, for the `declaration_copy_sources`
+   key. A declaration that Rocq MATERIALISED — through `Include M.`, `Module M := F(X).`
+   or `Declare Module M : S.` — has no vernac of its own, so the syntactic accumulator
+   above can never see it: nobody ever typed `succ_wd_obligation_1`. Measured on the
+   published corpus, that is 36% of every translated declaration, and 72% of those come
+   from four files (BinInt, PeanoNat, BinNat, Integers) whose entire content arrives
+   through a handful of `Include`s.
+
+   The vernac that CAUSED them is the honest attribution, and it is recoverable the same
+   way `declaration_order` recovers their existence: from the KERNEL, not the syntax.
+   `r2l_pending_copy` holds `(bp, ep, structure length)` captured BEFORE such a command
+   runs; `r2l_note_vernac_post`, called once the command has been executed, asks
+   `Global.r2l_structure_added` what appeared beyond that length and records each name
+   against the command's own span. The span is emitted as raw `.v` text exactly like
+   `declaration_sources`, so the consumer's existing text-location pass gives it a line
+   number for free.
+
+   Deliberately NOT diffed: `End M.` (it pops a whole module into one field, whose
+   contents already have their own real rows) and every other command (a `Definition`
+   is covered by the syntactic path, which is strictly better — it quotes the
+   declaration itself rather than the thing that copied it). *)
+let r2l_copy_spans : (string * int * int) list ref = ref []
+
+(* `(bp, ep, structure length, r2l_decl_spans length, is_copy)` for the command
+   currently being interpreted, or `None` when it is not one this hook diffs.
+   `is_copy` chooses which accumulator the discovered names land in — see
+   `r2l_diffed` for why the same diff answers two different questions. *)
+let r2l_pending_copy : (int * int * int * int * bool) option ref = ref None
+
 let r2l_reset_decl_spans () =
   r2l_decl_spans := [];
-  r2l_open_proof := None
+  r2l_open_proof := None;
+  r2l_copy_spans := [];
+  r2l_pending_copy := None
 
 let r2l_take_decl_spans () =
   let l = List.rev !r2l_decl_spans in
   r2l_decl_spans := [];
   l
+
+let r2l_take_copy_spans () =
+  let l = List.rev !r2l_copy_spans in
+  r2l_copy_spans := [];
+  l
+
+(* Which commands get the structure diff, and which accumulator their findings go to.
+
+   `Some true` — COPIES, whose real source is in ANOTHER file: `Include M.`,
+   `Module M := F(X).`, `Declare Module M : S.`. `Module M.` (no body) merely OPENS a
+   module — its contents arrive as their own vernacs — so only a BOUND module counts.
+
+   `Some false` — a declaration's OWN source that the syntactic path missed. The
+   syntactic path assumes a `Definition`/`Instance`/`Theorem` declares exactly the names
+   it writes down, and that a bodyless `Instance`/`Theorem` is closed by a later `Qed`.
+   `Program` breaks both: `Program Instance succ_wd : Proper (eq==>eq) S.` under an
+   `Obligation Tactic` discharges itself on the spot, so no `Qed` ever arrives (the
+   pending marker is dropped by the anti-bleed guard) AND it silently adds a second
+   constant, `succ_wd_obligation_1`, that nobody wrote. Both are recovered here, against
+   the command's OWN span — which really is their source — so they belong in
+   `declaration_sources`, not in the copy key.
+
+   This is SELF-GUARDING for the ordinary case: a `Theorem` that genuinely opens a proof
+   adds nothing to the environment until its `Qed`, so the diff is empty and the
+   syntactic path (which quotes the whole tactic script, far better) stays in charge.
+   Any name this command already recorded syntactically is filtered out in
+   `r2l_note_vernac_post`, so no name can ever get two rows.
+
+   NOT diffed, deliberately: `End M.` (pops a whole module into one field, whose
+   contents already have their own rows — recursing would re-attribute every one of
+   them to the `End`), `Qed` (the syntactic path pairs it with the opening command,
+   which is the useful span), and `Inductive` (its `_rect`/`_ind`/`_rec`/`_sind` are
+   better served by the consumer's "auto-generated from `<the inductive>`" message than
+   by quoting the inductive's text as if it were the eliminator's own source). *)
+let r2l_diffed (e : Vernacexpr.vernac_expr) : bool option =
+  let open Vernacexpr in
+  match e with
+  | VernacSynterp (VernacInclude _) -> Some true
+  | VernacSynterp (VernacDefineModule (_, _, _, _, body)) ->
+    if body <> [] then Some true else None
+  | VernacSynterp (VernacDeclareModule _) -> Some true
+  | VernacSynPure (VernacStartTheoremProof _)
+  | VernacSynPure (VernacInstance _)
+  | VernacSynPure (VernacDeclareInstance _)
+  | VernacSynPure (VernacDefinition _)
+  | VernacSynPure (VernacFixpoint _)
+  | VernacSynPure (VernacCoFixpoint _) -> Some false
+  | _ -> None
 
 (* The name(s) a vernac_expr declares, and whether it OPENS an interactive proof
    (its constant is added only when a LATER `Qed`/`Defined`/`Admitted` closes it)
@@ -152,6 +231,20 @@ let r2l_decl_names_opens_proof (e : Vernacexpr.vernac_expr) : (string list * boo
    replaced, and a swallowed exception here would drop that silently, file-wide. *)
 let r2l_note_vernac (com : Vernacexpr.vernac_control) =
   let open Vernacexpr in
+  (* The BEFORE half of the structure diff (see `r2l_copy_spans`). Cleared for every
+     other command so a length can never be carried across to the wrong one. *)
+  (try
+     r2l_pending_copy :=
+       (match com.CAst.loc, r2l_diffed com.CAst.v.expr with
+        | Some loc, Some is_copy ->
+          Some (loc.Loc.bp, loc.Loc.ep, Global.r2l_structure_len (),
+                List.length !r2l_decl_spans, is_copy)
+        | _, _ -> None)
+   with e ->
+     r2l_pending_copy := None;
+     Printf.eprintf "rocq2lean: r2l_note_vernac (copy pre-hook) FAILED -- the \
+declarations this command materialises will carry no provenance: %s\n%!"
+       (Printexc.to_string e));
   match com.CAst.loc with
   | None -> ()
   | Some loc ->
@@ -182,6 +275,37 @@ let r2l_note_vernac (com : Vernacexpr.vernac_control) =
        Printf.eprintf "rocq2lean: r2l_note_vernac FAILED -- this declaration's \
 source-text comment will be missing: %s\n%!" (Printexc.to_string e))
 
+(* The AFTER half of the structure diff (see `r2l_copy_spans`). Runs once the command
+   has actually been forced, so the safe environment already holds whatever it added.
+   A no-op — and specifically NOT a wrong row — whenever the diff shows no growth,
+   which is what happens if the command is ever left unforced. *)
+let r2l_note_vernac_post () =
+  match !r2l_pending_copy with
+  | None -> ()
+  | Some (bp, ep, n0, d0, is_copy) ->
+    r2l_pending_copy := None;
+    (try
+       (* Names this same command already recorded syntactically (the rows pushed past
+          `d0`). Filtered out so a `Definition f` can never end up with two rows — the
+          syntactic one is authoritative, the diff is only ever a backstop for what it
+          could not see (a `Program` obligation, an `Include`d member). *)
+       let own =
+         (* `r2l_decl_spans` is a stack, most recent FIRST, so this vernac's own rows
+            are the leading `length - d0`. *)
+         let rec firstn n l =
+           if n <= 0 then [] else match l with [] -> [] | x :: t -> x :: firstn (n - 1) t in
+         let cur = !r2l_decl_spans in
+         List.map (fun (n, _, _) -> n) (firstn (List.length cur - d0) cur) in
+       List.iter (fun (_kind, name) ->
+         if not (List.mem name own) then begin
+           if is_copy then r2l_copy_spans := (name, bp, ep) :: !r2l_copy_spans
+           else r2l_decl_spans := (name, bp, ep) :: !r2l_decl_spans
+         end)
+         (Global.r2l_structure_added n0)
+     with e ->
+       Printf.eprintf "rocq2lean: r2l_note_vernac_post FAILED -- the declarations this \
+command materialises will carry no provenance: %s\n%!" (Printexc.to_string e))
+
 let interp_vernac ~check ~state ({CAst.loc;_} as com) =
   r2l_note_vernac com;
   let open State in
@@ -194,6 +318,7 @@ let interp_vernac ~check ~state ({CAst.loc;_} as com) =
 
       (* Force the command  *)
       let () = if check then Stm.observe ~doc nsid in
+      r2l_note_vernac_post ();
       let new_proof = Vernacstate.Declare.give_me_the_proof_opt () [@ocaml.warning "-3"] in
       { state with doc; sid = nsid; proof = new_proof; }
     with reraise ->

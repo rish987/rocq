@@ -175,6 +175,69 @@ let r2l_structure_order () =
                      truncated): %s\n%!" (Printexc.to_string e));
   List.rev !acc
 
+(* rocq2lean: the two halves of a STRUCTURE DIFF around a single vernac command, for
+   the `.r2lmeta.json` `declaration_copy_sources` key.
+
+   `declaration_sources` is purely SYNTACTIC (`Vernac.r2l_note_vernac`): it records the
+   `.v` bytes of a vernac against the names that vernac NAMES. An `Include M.` or a
+   `Module M := F(X).` names nothing, yet materialises hundreds of real kernel
+   constants — 1408 of BinInt's 1678, all of PeanoNat's/BinNat's bulk — so every one of
+   them got NO row and the translator emitted an apology in place of provenance.
+
+   `declaration_order` never had that problem because it reads the KERNEL
+   (`r2l_structure_order` above) rather than the vernac syntax. This is the same trick,
+   narrowed to one command: take the length of the current module's `revstruct` BEFORE
+   the command runs and the SHORT names of everything beyond it AFTER, and the
+   difference is exactly what that command put in the environment. No event hooks, no
+   full-environment fold (which would be O(every Required library) per command).
+
+   Only ever called for a command that cannot itself change the CURRENT module
+   (`Include`, `Module M := …`, `Declare Module`), so the two lengths always measure
+   the same `revstruct`. `End M.` is deliberately NOT diffed: it pops a whole module
+   into one field, and recursing into that would re-attribute every declaration the
+   module made itself — which already has its own real source row. *)
+let r2l_structure_len () =
+  try List.length (Safe_typing.structure_body_of_safe_env (safe_env ())) with _ -> -1
+
+let r2l_structure_added n_before =
+  let acc = ref [] in
+  let rec walk sb =
+    List.iter (fun (l, field) ->
+      match field with
+      | Declarations.SFBconst _ -> acc := ("const", Names.Label.to_string l) :: !acc
+      (* Same rule as `r2l_structure_order`: ONE row per mutual-block MEMBER, named by
+         the packet's own `mind_typename`, since that is how the consumer keys them. *)
+      | Declarations.SFBmind mib ->
+        Array.iter (fun oib ->
+          acc := ("ind", Names.Id.to_string oib.Declarations.mind_typename) :: !acc)
+          mib.Declarations.mind_packets
+      (* `Module Int := Make(Wordsize_32).` adds ONE field — a whole submodule — so the
+         constants it materialises are one level down. A functor itself has no
+         instantiated contents; its applications appear where they are applied. *)
+      | Declarations.SFBmodule mb ->
+        (match Mod_declarations.mod_type mb with
+         | Declarations.NoFunctor sb' -> walk sb'
+         | Declarations.MoreFunctor _ -> ())
+      | Declarations.SFBmodtype _ | Declarations.SFBrules _ -> ()) sb in
+  (try
+     if n_before >= 0 then begin
+       let sb = Safe_typing.structure_body_of_safe_env (safe_env ()) in
+       let n_now = List.length sb in
+       (* `revstruct` is most-recent-FIRST, so the new fields are the LEADING
+          `n_now - n_before`; reversed back into declaration order before walking. *)
+       if n_now > n_before then begin
+         let rec take n l = if n <= 0 then [] else
+           match l with [] -> [] | x :: tl -> x :: take (n - 1) tl in
+         walk (List.rev (take (n_now - n_before) sb))
+       end
+     end
+   (* rocq2lean: LOUD, like every other sidecar hook. A swallowed failure here is
+      invisible downstream — the declarations simply keep saying "unavailable". *)
+   with e ->
+     Printf.eprintf "rocq2lean: r2l_structure_added ABORTED (declaration_copy_sources \
+will be short): %s\n%!" (Printexc.to_string e));
+  List.rev !acc
+
 let open_section () = globalize0 Safe_typing.open_section
 let close_section fs = globalize0_with_summary fs Safe_typing.close_section
 let sections_are_opened () = Safe_typing.sections_are_opened (safe_env())

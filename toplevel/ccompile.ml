@@ -2390,6 +2390,41 @@ of range (bp=%d ep=%d len=%d) -- skipped\n%!" name bp ep len)
               Printf.eprintf "rocq2lean: declaration_sources key FAILED -- every \
 declaration in this file will carry no ORIGINAL-SOURCE comment: %s\n%!"
                 (Printexc.to_string e));
+           (* rocq2lean: the same shape for the declarations NO vernac names -- the ones
+              an `Include M.` / `Module M := F(X).` / `Declare Module M : S.`
+              materialised (`Vernac.r2l_take_copy_spans`, a KERNEL structure diff around
+              that command rather than a syntactic read of it). `source` here is the
+              CAUSING COMMAND's own `.v` text, never the declaration's -- the
+              declaration has none in this file, by construction. Kept a SEPARATE key
+              from `declaration_sources` precisely so a consumer can never mistake one
+              for the other: quoting `Include NBasicProp.` where a reader expects
+              `Theorem add_comm : …` would be a lie, and the two are told apart by which
+              key the row came from. Row shape `[name, source]`, in command order. *)
+           Buffer.add_string buf "],\"declaration_copy_sources\":[";
+           (try
+              let spans = Vernac.r2l_take_copy_spans () in
+              if spans <> [] then begin
+                let ic = open_in_bin long_f_dot_in in
+                let len = in_channel_length ic in
+                let src = really_input_string ic len in
+                close_in ic;
+                let firstc = ref true in
+                List.iter (fun (name, bp, ep) ->
+                  if bp >= 0 && ep <= len && bp <= ep then begin
+                    if not !firstc then Buffer.add_char buf ',';
+                    firstc := false;
+                    Buffer.add_string buf
+                      (Printf.sprintf "[\"%s\",\"%s\"]"
+                         (esc name) (esc (String.sub src bp (ep - bp))))
+                  end else
+                    Printf.eprintf "rocq2lean: declaration_copy_sources: span for %s out \
+of range (bp=%d ep=%d len=%d) -- skipped\n%!" name bp ep len)
+                  spans
+              end
+            with e ->
+              Printf.eprintf "rocq2lean: declaration_copy_sources key FAILED -- every \
+`Include`d/instantiated declaration in this file will carry no provenance: %s\n%!"
+                (Printexc.to_string e));
            Buffer.add_string buf "]}";
            (* rocq2lean: explicit-cumulativity counters (R2L_TRACE_LIFT). *)
            if Option.has_some (Sys.getenv_opt "R2L_TRACE_LIFT") then

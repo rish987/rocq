@@ -68,6 +68,16 @@ val export_private_constants :
                        group by into a single Lean `mutual … end`. *)
 val r2l_structure_order : unit -> (string * string * int * string) list
 
+(* rocq2lean: the two halves of a STRUCTURE DIFF around ONE vernac command, used to
+   attribute the declarations an `Include`/`Module M := …` materialises — which have no
+   vernac of their own and therefore no `declaration_sources` row — to the command that
+   caused them. `r2l_structure_len` is called BEFORE the command, `r2l_structure_added`
+   with that length AFTER it, and returns `(kind, SHORT name)` for every constant and
+   inductive the command added (recursing into a submodule field, e.g. the whole module a
+   functor application binds). See the long comment in `global.ml`. *)
+val r2l_structure_len : unit -> int
+val r2l_structure_added : int -> (string * string) list
+
 val add_constant :
   ?typing_flags:typing_flags ->
   Id.t -> Entries.constant_entry -> Constant.t

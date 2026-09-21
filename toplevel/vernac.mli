@@ -44,3 +44,11 @@ val load_vernac : echo:bool -> check:bool ->
    through its closing `Qed`/`Defined`/`Admitted`. *)
 val r2l_reset_decl_spans : unit -> unit
 val r2l_take_decl_spans : unit -> (string * int * int) list
+
+(* rocq2lean: the same `(name, bp, ep)` shape, for the `declaration_copy_sources` key,
+   but covering the declarations no vernac NAMES -- the ones an `Include M.`,
+   `Module M := F(X).` or `Declare Module M : S.` materialises. `bp`/`ep` span that
+   CAUSING command, not the declaration (which has no source in this file at all); the
+   names come from a structure diff taken around it. Reset by
+   `r2l_reset_decl_spans` along with its syntactic twin. *)
+val r2l_take_copy_spans : unit -> (string * int * int) list
