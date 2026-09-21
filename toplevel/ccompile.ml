@@ -1510,10 +1510,47 @@ the one wrong conclusion this key exists to prevent: %s\n%!"
                                       jarr (List.map jpat subs); jname na]
                       ^ ",\"loc\":null}" in
               let firstg = ref true in
+              (* rocq2lean: a `Qed.`-terminated constant's body is NOT lost. Rocq
+                 retains it in the OPAQUE TABLE -- that is how `Print Assumptions`
+                 walks a Qed'd proof, and how the kernel delta-reduces an opaque
+                 constant during conversion. Matching `Declarations.Def` alone
+                 therefore silently skips every `Qed.`'d constant.
+
+                 That is harmless for a Prop-valued one (its proof is exactly what
+                 this project never translates) but NOT for a constant whose TYPE
+                 is data -- `{x | P x}`, `{A}+{B}`, a `: Type` class instance. For
+                 those the consumer correctly decides to emit a `def` (it has the
+                 sort from `constant_sorts`) and then has no right-hand side, so it
+                 emits `sorry`. A data-valued `sorry` is a soundness bug, not a
+                 proof handoff: it asserts an inhabitant of a type that may be
+                 empty, and `sorryAx` is inconsistent, so every declaration
+                 reaching one is formally worthless.
+
+                 Gated on the type's sort being NON-Prop for cost, not correctness:
+                 forcing every opaque body would materialise the entire proof
+                 corpus (~20k terms in Stdlib alone) into the sidecar, for a
+                 consumer that discards all of it. `Sorts.Prop`/`SProp` are the
+                 only sorts whose inhabitants are proofs. *)
+              let r2l_force_body cb =
+                match cb.Declarations.const_body with
+                | Declarations.Def body -> Some body
+                | Declarations.OpaqueDef _ ->
+                  (try
+                     let ty = EConstr.of_constr cb.Declarations.const_type in
+                     let s = Retyping.get_sort_of env evd ty in
+                     (match EConstr.ESorts.kind evd s with
+                      | Sorts.Prop | Sorts.SProp -> None
+                      | _ ->
+                        (match Global.body_of_constant_body
+                                 Library.indirect_accessor cb with
+                         | Some (bc, _, _) -> Some bc
+                         | None -> None))
+                   with _ -> None)
+                | _ -> None in
               Environ.fold_constants (fun c cb () ->
                 if Names.ModPath.equal (mp_root (Names.Constant.modpath c)) this_mp then
-                  match cb.Declarations.const_body with
-                  | Declarations.Def body ->
+                  match r2l_force_body cb with
+                  | Some body ->
                     (try
                        (* rocq2lean: force RAW-PRINT detype so a 2-ctor
                           match (e.g. bool) is emitted as a real `GCases`
@@ -1538,7 +1575,7 @@ the one wrong conclusion this key exists to prevent: %s\n%!"
                        Buffer.add_string buf
                          (Printf.sprintf "[\"%s\",%s]" (esc (Names.Constant.to_string c)) j)
                      with _ -> ())
-                  | _ -> ()) env ();
+                  | None -> ()) env ();
               (* rocq2lean: TYPE globs — detype each this-file constant's
                  `const_type` (its STATEMENT), for EVERY constant regardless of
                  body kind. Theorems/lemmas have opaque (proof) bodies, so they
